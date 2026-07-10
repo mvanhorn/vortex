@@ -5,6 +5,7 @@
 //!
 //! The main entrypoint is [`execute_filter`] which filters any [`Canonical`] array.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use vortex_error::VortexExpect;
@@ -48,6 +49,16 @@ fn filter_validity(validity: Validity, mask: &Arc<MaskValues>) -> Validity {
         .vortex_expect("Somehow unable to wrap filter around a validity array")
 }
 
+pub(super) fn contiguous_filter_range(mask: &Mask) -> Option<Range<usize>> {
+    let start = mask.first()?;
+    let end = mask.last()?.checked_add(1)?;
+    (end - start == mask.true_count()).then_some(start..end)
+}
+
+pub(super) fn prepare_mask_for_reuse(mask: &MaskValues, consumers: usize) {
+    buffer::prepare_mask_for_reuse(mask, consumers);
+}
+
 /// Check for some fast-path execution conditions before calling [`execute_filter`].
 pub(super) fn execute_filter_fast_paths(
     array: ArrayView<'_, Filter>,
@@ -63,6 +74,11 @@ pub(super) fn execute_filter_fast_paths(
     // If the mask selects everything, then we can just fully decompress the whole thing.
     if true_count == array.mask.len() {
         return Ok(Some(array.child().clone()));
+    }
+
+    // Filtering by one contiguous range is exactly a slice and can remain zero-copy.
+    if let Some(range) = contiguous_filter_range(array.filter_mask()) {
+        return array.child().slice(range).map(Some);
     }
 
     // Also check if the array itself is completely null, in which case we only care about the total
@@ -118,5 +134,36 @@ pub(super) fn execute_filter(canonical: Canonical, mask: &Arc<MaskValues>) -> Ca
                     .vortex_expect("filtered VariantArray children are row-aligned"),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex_error::VortexResult;
+
+    use super::*;
+    use crate::VortexSessionExecute;
+    use crate::array_session;
+    use crate::arrays::PrimitiveArray;
+
+    #[test]
+    fn contiguous_filter_executes_as_zero_copy_slice() -> VortexResult<()> {
+        let array = PrimitiveArray::from_iter(0i32..8);
+        let original = array.to_buffer::<i32>();
+        let filtered = array
+            .into_array()
+            .filter(Mask::from_slices(8, vec![(2, 6)]))?
+            .execute::<PrimitiveArray>(&mut array_session().create_execution_ctx())?;
+        let filtered_values = filtered.to_buffer::<i32>();
+
+        assert_eq!(filtered_values.as_slice(), &[2, 3, 4, 5]);
+        assert_eq!(filtered_values.as_ptr(), original.as_ptr().wrapping_add(2));
+        Ok(())
+    }
+
+    #[test]
+    fn fragmented_filter_is_not_a_contiguous_range() {
+        let mask = Mask::from_indices(8, [1, 2, 5, 6]);
+        assert_eq!(contiguous_filter_range(&mask), None);
     }
 }

@@ -32,13 +32,48 @@ pub fn filter_decimal(array: &DecimalArray, mask: &Arc<MaskValues>) -> DecimalAr
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+    use rstest::rstest;
+
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::array_session;
     use crate::arrays::filter::execute::decimal::DecimalArray;
     use crate::compute::conformance::filter::test_filter_conformance;
     use crate::dtype::DecimalDType;
+    use crate::dtype::i256;
+
+    #[rstest]
+    #[case(DecimalArray::from_iter(
+        [1i8, 2, 3, 4, 5],
+        DecimalDType::new(2, 0),
+    ))]
+    #[case(DecimalArray::from_iter(
+        [10i16, 20, 30, 40, 50],
+        DecimalDType::new(3, 0),
+    ))]
+    #[case(DecimalArray::from_iter(
+        [100i32, 200, 300, 400, 500],
+        DecimalDType::new(5, 0),
+    ))]
+    #[case(DecimalArray::from_iter(
+        [1_000i64, 2_000, 3_000, 4_000, 5_000],
+        DecimalDType::new(10, 0),
+    ))]
+    #[case(DecimalArray::from_iter(
+        [10_000i128, 20_000, 30_000, 40_000, 50_000],
+        DecimalDType::new(19, 0),
+    ))]
+    #[case(DecimalArray::from_iter(
+        [1i128, 2, 3, 4, 5].map(i256::from_i128),
+        DecimalDType::new(39, 0),
+    ))]
+    fn test_filter_decimal_physical_type_conformance(#[case] array: DecimalArray) {
+        test_filter_conformance(
+            &array.into_array(),
+            &mut array_session().create_execution_ctx(),
+        );
+    }
 
     #[test]
     fn test_filter_decimal128_conformance() {
