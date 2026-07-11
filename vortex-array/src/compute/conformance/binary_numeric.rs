@@ -40,8 +40,12 @@ use crate::RecursiveCanonical;
 use crate::arrays::ConstantArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
+use crate::dtype::DecimalDType;
+use crate::dtype::NativeDecimalType;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
+use crate::dtype::i256;
+use crate::scalar::DecimalValue;
 use crate::scalar::NumericOperator;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
@@ -240,9 +244,115 @@ pub fn test_binary_numeric_array(array: &ArrayRef, ctx: &mut ExecutionCtx) {
             PType::F32 => test_binary_numeric_conformance::<f32>(array, ctx),
             PType::F64 => test_binary_numeric_conformance::<f64>(array, ctx),
         },
+        DType::Decimal(decimal_dtype, _) => {
+            test_binary_numeric_conformance_decimal(array, *decimal_dtype, ctx)
+        }
         dtype => vortex_panic!(
-            "Binary numeric tests are only supported for primitive numeric types, got {dtype}",
+            "Binary numeric tests are only supported for primitive and decimal types, got {dtype}",
         ),
+    }
+}
+
+/// Tests binary numeric operations on a decimal array against the decimal scalar
+/// implementation, using a set of representative constants: stored `0`, `1`, `-1`, the decimal
+/// `1.0` (when it fits the precision), and the largest stored value for the precision.
+fn test_binary_numeric_conformance_decimal(
+    array: &ArrayRef,
+    decimal_dtype: DecimalDType,
+    ctx: &mut ExecutionCtx,
+) {
+    let precision = decimal_dtype.precision() as usize;
+    let prec_max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[precision];
+
+    let mut constants = vec![
+        i256::from_i128(0),
+        i256::from_i128(1),
+        i256::from_i128(-1),
+        prec_max,
+    ];
+    // The decimal value 1.0 (stored 10^s), when representable within the precision.
+    if decimal_dtype.scale() >= 0
+        && let Some(one) = i256::from_i128(10).checked_pow(decimal_dtype.scale() as u32)
+        && one <= prec_max
+    {
+        constants.push(one);
+    }
+
+    for constant in constants {
+        let value = DecimalValue::try_from_i256(constant, decimal_dtype)
+            .vortex_expect("conformance constants fit the precision");
+        test_decimal_binary_numeric_with_scalar(array, value, decimal_dtype, ctx);
+    }
+}
+
+fn test_decimal_binary_numeric_with_scalar(
+    array: &ArrayRef,
+    value: DecimalValue,
+    decimal_dtype: DecimalDType,
+    ctx: &mut ExecutionCtx,
+) {
+    let canonicalized_array = array
+        .clone()
+        .execute::<Canonical>(ctx)
+        .vortex_expect("Must be able to canonicalise")
+        .into_array();
+    let original_values = to_vec_of_scalar(&canonicalized_array, ctx);
+
+    let scalar = Scalar::decimal(value, decimal_dtype, array.dtype().nullability());
+
+    // Decimal Mul/Div are not yet implemented.
+    let operators = vec![NumericOperator::Add, NumericOperator::Sub];
+
+    for operator in operators {
+        let rhs_const = ConstantArray::new(scalar.clone(), array.len()).into_array();
+
+        for lhs_is_array in [true, false] {
+            let (lhs, rhs) = if lhs_is_array {
+                (array.clone(), rhs_const.clone())
+            } else {
+                (rhs_const.clone(), array.clone())
+            };
+
+            let result = lhs
+                .binary(rhs, operator.into())
+                .vortex_expect("apply shouldn't fail")
+                .execute::<RecursiveCanonical>(ctx)
+                .map(|c| c.0.into_array());
+
+            // Skip this operator if the entire operation fails (e.g. an overflowing lane).
+            let Ok(result) = result else {
+                continue;
+            };
+
+            let actual_values = to_vec_of_scalar(&result, ctx);
+            let expected_results: Vec<Option<Scalar>> = original_values
+                .iter()
+                .map(|x| {
+                    let (lhs, rhs) = if lhs_is_array {
+                        (x.as_decimal(), scalar.as_decimal())
+                    } else {
+                        (scalar.as_decimal(), x.as_decimal())
+                    };
+                    lhs.checked_binary_numeric(&rhs, operator).map(Scalar::from)
+                })
+                .collect();
+
+            // For elements that didn't overflow, check they match.
+            for (idx, (actual, expected)) in actual_values.iter().zip(&expected_results).enumerate()
+            {
+                if let Some(expected_value) = expected {
+                    assert_eq!(
+                        actual,
+                        expected_value,
+                        "Decimal binary numeric operation failed for encoding {} at index {}: \
+                         ({array:?})[{idx}] {operator:?} {scalar} (lhs_is_array: {lhs_is_array}) \
+                         expected {expected_value:?}, got {actual:?}",
+                        array.encoding_id(),
+                        idx,
+                    );
+                }
+            }
+        }
     }
 }
 
