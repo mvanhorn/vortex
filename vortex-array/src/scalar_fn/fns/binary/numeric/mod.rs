@@ -6,6 +6,7 @@
 //!
 //! [`Binary`]: super::Binary
 
+mod decimal;
 mod primitive;
 #[cfg(test)]
 mod tests;
@@ -15,10 +16,12 @@ use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::dtype::DType;
 use crate::scalar::NumericOperator;
 
 /// Execute a numeric operation between two arrays.
@@ -28,7 +31,19 @@ pub(crate) fn execute_numeric(
     op: NumericOperator,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    primitive::execute_numeric_primitive(lhs, rhs, op, ctx)
+    if !lhs.dtype().eq_ignore_nullability(rhs.dtype()) {
+        vortex_bail!(
+            "numeric operator requires matching types, got {} and {}",
+            lhs.dtype(),
+            rhs.dtype()
+        );
+    }
+
+    match lhs.dtype() {
+        DType::Primitive(..) => primitive::execute_numeric_primitive(lhs, rhs, op, ctx),
+        DType::Decimal(..) => decimal::execute_numeric_decimal(lhs, rhs, op, ctx),
+        dtype => vortex_bail!("numeric operator is not supported for dtype {}", dtype),
+    }
 }
 
 /// The values produced by a checked lane loop, plus whether any lane failed.

@@ -117,13 +117,6 @@ pub(super) fn execute_numeric_primitive(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let ptype = PType::try_from(lhs.dtype())?;
-    if !lhs.dtype().eq_ignore_nullability(rhs.dtype()) {
-        vortex_bail!(
-            "numeric operator requires matching primitive types, got {} and {}",
-            lhs.dtype(),
-            rhs.dtype()
-        );
-    }
 
     match_each_native_ptype!(ptype, |T| {
         match op {

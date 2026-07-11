@@ -118,7 +118,10 @@ impl ScalarFnVTable for Binary {
         let rhs = &arg_dtypes[1];
 
         if operator.is_arithmetic() {
-            if lhs.is_primitive() && lhs.eq_ignore_nullability(rhs) {
+            // Decimal Mul/Div need rescaling support and are not yet implemented.
+            let decimal_supported =
+                lhs.is_decimal() && matches!(operator, Operator::Add | Operator::Sub);
+            if (lhs.is_primitive() || decimal_supported) && lhs.eq_ignore_nullability(rhs) {
                 return Ok(lhs.with_nullability(lhs.nullability() | rhs.nullability()));
             }
             vortex_bail!(
