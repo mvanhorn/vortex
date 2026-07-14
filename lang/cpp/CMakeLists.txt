@@ -125,14 +125,16 @@ if(TARGET vortex_ffi_shared)
     endif()
 endif()
 
-if (BUILD_TESTS)
+if (BUILD_TESTS OR BUILD_EXAMPLES)
     FetchContent_Declare(
       Nanoarrow
       GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow
       GIT_TAG        apache-arrow-nanoarrow-0.8.0
     )
     FetchContent_MakeAvailable(Nanoarrow)
+endif()
 
+if (BUILD_TESTS)
     FetchContent_Declare(
         Catch
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -144,4 +146,8 @@ if (BUILD_TESTS)
 
     include(CTest)
     add_subdirectory(tests)
+endif()
+
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()
