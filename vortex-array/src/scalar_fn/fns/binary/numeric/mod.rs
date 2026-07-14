@@ -20,7 +20,9 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 
 use crate::ArrayRef;
+use crate::Canonical;
 use crate::ExecutionCtx;
+use crate::IntoArray;
 use crate::dtype::DType;
 use crate::scalar::NumericOperator;
 
@@ -37,6 +39,21 @@ pub(crate) fn execute_numeric(
             lhs.dtype(),
             rhs.dtype()
         );
+    }
+
+    if lhs.len() != rhs.len() {
+        vortex_bail!(
+            "numeric operator requires equal lengths, got {} and {}",
+            lhs.len(),
+            rhs.len()
+        );
+    }
+
+    if lhs.is_empty() {
+        let result_dtype = lhs
+            .dtype()
+            .with_nullability(lhs.dtype().nullability() | rhs.dtype().nullability());
+        return Ok(Canonical::empty(&result_dtype).into_array());
     }
 
     match lhs.dtype() {

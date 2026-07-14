@@ -17,6 +17,7 @@ use crate::assert_arrays_eq;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
+use crate::dtype::DecimalType;
 use crate::dtype::Nullability;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
@@ -212,6 +213,19 @@ fn test_present_nullable_constant_preserves_nullable_output() {
     );
 }
 
+#[test]
+fn test_empty_primitive_constants_do_not_evaluate() -> VortexResult<()> {
+    let lhs = ConstantArray::new(u8::MAX, 0).into_array();
+    let rhs = ConstantArray::new(1u8, 0).into_array();
+
+    let result = lhs
+        .binary(rhs, Operator::Add)?
+        .execute::<RecursiveCanonical>(&mut array_session().create_execution_ctx())?;
+
+    assert!(result.0.is_empty());
+    Ok(())
+}
+
 // -- Decimal arithmetic --
 
 fn decimal_binary(lhs: ArrayRef, rhs: ArrayRef, op: Operator) -> VortexResult<ArrayRef> {
@@ -319,6 +333,46 @@ fn test_decimal_precision_stricter_than_width() {
     let rhs = DecimalArray::from_iter::<i8, _>([60], dtype).into_array();
 
     assert!(decimal_binary(lhs, rhs, Operator::Add).is_err());
+}
+
+#[rstest]
+#[case::precision_2(
+    DecimalArray::from_iter::<i8, _>([10, 20], DecimalDType::new(2, 0)),
+    DecimalType::I8,
+)]
+#[case::precision_18(
+    DecimalArray::from_iter::<i64, _>([10, 20], DecimalDType::new(18, 0)),
+    DecimalType::I64,
+)]
+#[case::precision_38(
+    DecimalArray::from_iter::<i128, _>([10, 20], DecimalDType::new(38, 0)),
+    DecimalType::I128,
+)]
+fn test_decimal_result_uses_logical_storage_width(
+    #[case] values: DecimalArray,
+    #[case] expected_type: DecimalType,
+) -> VortexResult<()> {
+    let result = decimal_binary(
+        values.clone().into_array(),
+        values.into_array(),
+        Operator::Add,
+    )?
+    .execute::<DecimalArray>(&mut array_session().create_execution_ctx())?;
+
+    assert_eq!(result.values_type(), expected_type);
+    Ok(())
+}
+
+#[test]
+fn test_decimal_empty_constants_do_not_evaluate() -> VortexResult<()> {
+    let dtype = DecimalDType::new(3, 0);
+    let lhs = decimal_constant(999i16, dtype, 0);
+    let rhs = decimal_constant(1i16, dtype, 0);
+
+    let result = decimal_binary(lhs, rhs, Operator::Add)?;
+
+    assert!(result.is_empty());
+    Ok(())
 }
 
 #[test]

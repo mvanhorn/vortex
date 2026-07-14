@@ -313,18 +313,6 @@ fn test_decimal_binary_numeric_with_scalar(
                 (rhs_const.clone(), array.clone())
             };
 
-            let result = lhs
-                .binary(rhs, operator.into())
-                .vortex_expect("apply shouldn't fail")
-                .execute::<RecursiveCanonical>(ctx)
-                .map(|c| c.0.into_array());
-
-            // Skip this operator if the entire operation fails (e.g. an overflowing lane).
-            let Ok(result) = result else {
-                continue;
-            };
-
-            let actual_values = to_vec_of_scalar(&result, ctx);
             let expected_results: Vec<Option<Scalar>> = original_values
                 .iter()
                 .map(|x| {
@@ -337,20 +325,46 @@ fn test_decimal_binary_numeric_with_scalar(
                 })
                 .collect();
 
-            // For elements that didn't overflow, check they match.
+            let result = lhs
+                .binary(rhs, operator.into())
+                .vortex_expect("apply shouldn't fail")
+                .execute::<RecursiveCanonical>(ctx)
+                .map(|c| c.0.into_array());
+
+            let expects_overflow = expected_results.iter().any(Option::is_none);
+            if expects_overflow {
+                assert!(
+                    result.is_err(),
+                    "Decimal binary numeric operation should overflow for encoding {}: \
+                     {operator:?} {scalar} (lhs_is_array: {lhs_is_array})",
+                    array.encoding_id(),
+                );
+                continue;
+            }
+
+            let result = result.unwrap_or_else(|err| {
+                vortex_panic!(
+                    "Decimal binary numeric operation unexpectedly failed for encoding {}: \
+                     {operator:?} {scalar} (lhs_is_array: {lhs_is_array}): {err}",
+                    array.encoding_id(),
+                )
+            });
+
+            let actual_values = to_vec_of_scalar(&result, ctx);
             for (idx, (actual, expected)) in actual_values.iter().zip(&expected_results).enumerate()
             {
-                if let Some(expected_value) = expected {
-                    assert_eq!(
-                        actual,
-                        expected_value,
-                        "Decimal binary numeric operation failed for encoding {} at index {}: \
-                         ({array:?})[{idx}] {operator:?} {scalar} (lhs_is_array: {lhs_is_array}) \
-                         expected {expected_value:?}, got {actual:?}",
-                        array.encoding_id(),
-                        idx,
-                    );
-                }
+                let expected_value = expected
+                    .as_ref()
+                    .vortex_expect("non-overflowing decimal lane must have an expected value");
+                assert_eq!(
+                    actual,
+                    expected_value,
+                    "Decimal binary numeric operation failed for encoding {} at index {}: \
+                     ({array:?})[{idx}] {operator:?} {scalar} (lhs_is_array: {lhs_is_array}) \
+                     expected {expected_value:?}, got {actual:?}",
+                    array.encoding_id(),
+                    idx,
+                );
             }
         }
     }

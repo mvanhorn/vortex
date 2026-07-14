@@ -32,7 +32,7 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::DecimalArray;
 use crate::arrays::decimal::DecimalArrayExt;
-use crate::arrays::decimal::widened_buffer;
+use crate::dtype::BigCast;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::DecimalType;
@@ -62,42 +62,88 @@ pub(super) fn execute_numeric_decimal(
     let lhs = DecimalOperand::try_new(lhs, ctx)?;
     let rhs = DecimalOperand::try_new(rhs, ctx)?;
     let len = lhs.len();
-    if len != rhs.len() {
-        vortex_bail!(
-            "numeric operator requires equal lengths, got {} and {}",
-            len,
-            rhs.len()
-        );
-    }
+    debug_assert_eq!(len, rhs.len());
 
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
 
-    let work = working_type(&lhs, &rhs, decimal_dtype);
-    match_each_decimal_value_type!(work, |W| {
-        match op {
-            NumericOperator::Add => execute_decimal_typed::<W, DecimalAdd>(
-                &lhs,
-                &rhs,
-                decimal_dtype,
-                &result_dtype,
-                validity,
-                &valid_rows,
-            ),
-            NumericOperator::Sub => execute_decimal_typed::<W, DecimalSub>(
-                &lhs,
-                &rhs,
-                decimal_dtype,
-                &result_dtype,
-                validity,
-                &valid_rows,
-            ),
-            NumericOperator::Mul | NumericOperator::Div => vortex_bail!(
-                "numeric operator {:?} is not yet supported for decimal arrays",
-                op
-            ),
-        }
-    })
+    let work = working_type(decimal_dtype);
+    let output = DecimalType::smallest_decimal_value_type(&decimal_dtype);
+    match (work, output) {
+        (DecimalType::I8, DecimalType::I8) => execute_decimal_at_widths::<i8, i8>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I16, DecimalType::I8) => execute_decimal_at_widths::<i16, i8>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I16, DecimalType::I16) => execute_decimal_at_widths::<i16, i16>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I32, DecimalType::I32) => execute_decimal_at_widths::<i32, i32>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I64, DecimalType::I64) => execute_decimal_at_widths::<i64, i64>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I128, DecimalType::I128) => execute_decimal_at_widths::<i128, i128>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I256, DecimalType::I128) => execute_decimal_at_widths::<i256, i128>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        (DecimalType::I256, DecimalType::I256) => execute_decimal_at_widths::<i256, i256>(
+            &lhs,
+            &rhs,
+            op,
+            decimal_dtype,
+            &result_dtype,
+            validity,
+            &valid_rows,
+        ),
+        _ => vortex_bail!("unsupported decimal working/output width combination: {work}/{output}"),
+    }
 }
 
 /// A decimal binary-operator operand: a canonical decimal array, a non-null constant, or an
@@ -152,20 +198,14 @@ impl DecimalOperand {
     }
 }
 
-/// Choose the lane width: wide enough for the operand storage and for every intermediate value
-/// that in-precision inputs can produce, capped at 256 bits.
-fn working_type(lhs: &DecimalOperand, rhs: &DecimalOperand, dtype: DecimalDType) -> DecimalType {
-    // The sum or difference of two p-digit values has at most p + 1 digits.
-    let needed_digits = (dtype.precision() + 1).min(<i256 as NativeDecimalType>::MAX_PRECISION);
-    let needed = DecimalType::smallest_decimal_value_type(&DecimalDType::new(needed_digits, 0));
-
-    let operand_type = |operand: &DecimalOperand| match operand {
-        DecimalOperand::Array { values, .. } => values.values_type(),
-        DecimalOperand::Constant { value, .. } => smallest_value_type(value),
-        DecimalOperand::Null(_) => DecimalType::I8,
-    };
-
-    needed.max(operand_type(lhs)).max(operand_type(rhs))
+/// Choose the smallest lane width that can represent every sum or difference of two valid inputs.
+fn working_type(dtype: DecimalDType) -> DecimalType {
+    let precision = dtype.precision() as usize;
+    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[precision];
+    let max_result = max
+        .checked_add(&max)
+        .vortex_expect("the sum of two valid decimal values must fit in i256");
+    smallest_value_type(&DecimalValue::from(max_result))
 }
 
 /// The smallest decimal value type that can represent `value`, regardless of its stored width.
@@ -245,7 +285,45 @@ impl CheckedDecimalOp for DecimalSub {
     }
 }
 
-fn execute_decimal_typed<W, Op>(
+fn execute_decimal_at_widths<W, O>(
+    lhs: &DecimalOperand,
+    rhs: &DecimalOperand,
+    op: NumericOperator,
+    decimal_dtype: DecimalDType,
+    result_dtype: &DType,
+    validity: Validity,
+    valid_rows: &Mask,
+) -> VortexResult<ArrayRef>
+where
+    W: NativeDecimalType + CheckedAdd + CheckedSub,
+    O: NativeDecimalType,
+    DecimalValue: From<O>,
+{
+    match op {
+        NumericOperator::Add => execute_decimal_typed::<W, O, DecimalAdd>(
+            lhs,
+            rhs,
+            decimal_dtype,
+            result_dtype,
+            validity,
+            valid_rows,
+        ),
+        NumericOperator::Sub => execute_decimal_typed::<W, O, DecimalSub>(
+            lhs,
+            rhs,
+            decimal_dtype,
+            result_dtype,
+            validity,
+            valid_rows,
+        ),
+        NumericOperator::Mul | NumericOperator::Div => vortex_bail!(
+            "numeric operator {:?} is not yet supported for decimal arrays",
+            op
+        ),
+    }
+}
+
+fn execute_decimal_typed<W, O, Op>(
     lhs: &DecimalOperand,
     rhs: &DecimalOperand,
     decimal_dtype: DecimalDType,
@@ -255,7 +333,8 @@ fn execute_decimal_typed<W, Op>(
 ) -> VortexResult<ArrayRef>
 where
     W: NativeDecimalType + CheckedAdd + CheckedSub,
-    DecimalValue: From<W>,
+    O: NativeDecimalType,
+    DecimalValue: From<O>,
     Op: CheckedDecimalOp,
 {
     let len = lhs.len();
@@ -263,21 +342,25 @@ where
 
     let checked = match (lhs, rhs) {
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Array { values: rhs, .. }) => {
-            let lhs = widened_buffer::<W>(lhs);
-            let rhs = widened_buffer::<W>(rhs);
-            checked_decimal_lanes(len, valid_rows, |idx| {
-                Op::checked(lhs[idx], rhs[idx], &plan)
-            })
+            checked_decimal_arrays::<W, O, Op>(lhs, rhs, &plan, valid_rows)
         }
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Constant { value, .. }) => {
-            let lhs = widened_buffer::<W>(lhs);
             let rhs = typed_constant::<W>(value);
-            checked_decimal_lanes(len, valid_rows, |idx| Op::checked(lhs[idx], rhs, &plan))
+            match_each_decimal_value_type!(lhs.values_type(), |L| {
+                let lhs = lhs.buffer::<L>();
+                checked_decimal_lanes::<W, O, _>(len, valid_rows, |idx| {
+                    Op::checked(cast_work_value::<W, L>(lhs[idx]), rhs, &plan)
+                })
+            })
         }
         (DecimalOperand::Constant { value, .. }, DecimalOperand::Array { values: rhs, .. }) => {
             let lhs = typed_constant::<W>(value);
-            let rhs = widened_buffer::<W>(rhs);
-            checked_decimal_lanes(len, valid_rows, |idx| Op::checked(lhs, rhs[idx], &plan))
+            match_each_decimal_value_type!(rhs.values_type(), |R| {
+                let rhs = rhs.buffer::<R>();
+                checked_decimal_lanes::<W, O, _>(len, valid_rows, |idx| {
+                    Op::checked(lhs, cast_work_value::<W, R>(rhs[idx]), &plan)
+                })
+            })
         }
         (
             DecimalOperand::Constant { value: lhs, .. },
@@ -287,6 +370,7 @@ where
             let rhs = typed_constant::<W>(rhs);
             let value = Op::checked(lhs, rhs, &plan)
                 .ok_or_else(|| vortex_err!(InvalidArgument: "{}", Op::ERROR))?;
+            let value = cast_result_value::<W, O>(value);
             return Ok(ConstantArray::new(
                 Scalar::decimal(
                     DecimalValue::from(value),
@@ -297,7 +381,9 @@ where
             )
             .into_array());
         }
-        (DecimalOperand::Null(_), _) | (_, DecimalOperand::Null(_)) => CheckedValues::zeroed(len),
+        (DecimalOperand::Null(_), _) | (_, DecimalOperand::Null(_)) => {
+            CheckedValues::<O>::zeroed(len)
+        }
     };
     check_numeric_errors(checked.failed, Op::ERROR)?;
 
@@ -309,16 +395,63 @@ where
     .into_array())
 }
 
-fn checked_decimal_lanes<W, F>(len: usize, valid_rows: &Mask, checked_at: F) -> CheckedValues<W>
+fn checked_decimal_arrays<W, O, Op>(
+    lhs: &DecimalArray,
+    rhs: &DecimalArray,
+    plan: &DecimalOpPlan<W>,
+    valid_rows: &Mask,
+) -> CheckedValues<O>
+where
+    W: NativeDecimalType + CheckedAdd + CheckedSub,
+    O: NativeDecimalType,
+    Op: CheckedDecimalOp,
+{
+    let len = lhs.len();
+    debug_assert_eq!(len, rhs.len());
+    match_each_decimal_value_type!(lhs.values_type(), |L| {
+        let lhs = lhs.buffer::<L>();
+        match_each_decimal_value_type!(rhs.values_type(), |R| {
+            let rhs = rhs.buffer::<R>();
+            checked_decimal_lanes::<W, O, _>(len, valid_rows, |idx| {
+                Op::checked(
+                    cast_work_value::<W, L>(lhs[idx]),
+                    cast_work_value::<W, R>(rhs[idx]),
+                    plan,
+                )
+            })
+        })
+    })
+}
+
+fn checked_decimal_lanes<W, O, F>(
+    len: usize,
+    valid_rows: &Mask,
+    mut checked_at: F,
+) -> CheckedValues<O>
 where
     W: NativeDecimalType,
+    O: NativeDecimalType,
     F: FnMut(usize) -> Option<W>,
 {
     match valid_rows.bit_buffer() {
-        AllOr::All => checked_all_lanes(len, checked_at),
-        AllOr::None => CheckedValues::zeroed(len),
-        AllOr::Some(valid_bits) => checked_valid_lanes(len, valid_bits, checked_at),
+        AllOr::All => checked_all_lanes(len, |idx| checked_at(idx).map(cast_result_value::<W, O>)),
+        AllOr::None => CheckedValues::<O>::zeroed(len),
+        AllOr::Some(valid_bits) => checked_valid_lanes(len, valid_bits, |idx| {
+            checked_at(idx).map(cast_result_value::<W, O>)
+        }),
     }
+}
+
+#[inline(always)]
+fn cast_work_value<W: NativeDecimalType, T: NativeDecimalType>(value: T) -> W {
+    <W as BigCast>::from(value)
+        .vortex_expect("valid decimal input must fit the arithmetic working width")
+}
+
+#[inline(always)]
+fn cast_result_value<W: NativeDecimalType, O: NativeDecimalType>(value: W) -> O {
+    <O as BigCast>::from(value)
+        .vortex_expect("precision-checked decimal result must fit the output width")
 }
 
 fn typed_constant<W: NativeDecimalType>(value: &DecimalValue) -> W {

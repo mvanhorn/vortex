@@ -5,7 +5,6 @@ use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
@@ -145,13 +144,7 @@ where
     let lhs = PrimitiveOperand::<T>::try_new(lhs, ctx)?;
     let rhs = PrimitiveOperand::<T>::try_new(rhs, ctx)?;
     let len = lhs.len();
-    if len != rhs.len() {
-        vortex_bail!(
-            "numeric operator requires equal lengths, got {} and {}",
-            len,
-            rhs.len()
-        );
-    }
+    debug_assert_eq!(len, rhs.len());
 
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
