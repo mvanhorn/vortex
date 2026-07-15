@@ -5,14 +5,13 @@ use futures::SinkExt;
 use futures::TryStreamExt;
 use futures::channel::mpsc;
 use futures::channel::mpsc::Sender;
+use parking_lot::Mutex;
 use vortex::array::ArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::dtype::DType;
 use vortex::error::VortexResult;
-use vortex::error::vortex_bail;
 use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
-use vortex::file::VortexFile;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
 use vortex::io::runtime::BlockingRuntime;
@@ -20,7 +19,6 @@ use vortex::io::runtime::Task;
 use vortex::io::session::RuntimeSessionExt;
 
 use crate::RUNTIME;
-use crate::arc_wrapper;
 use crate::array::vx_array;
 use crate::dtype::vx_dtype;
 use crate::error::try_or_default;
@@ -28,130 +26,144 @@ use crate::error::vx_error;
 use crate::session::vx_session;
 use crate::string::vx_view;
 
-arc_wrapper!(
-    /// A handle to a Vortex file encapsulating the footer and logic for instantiating a reader.
-    VortexFile,
-    vx_file
-);
-
 #[expect(non_camel_case_types)]
-/// The `sink` interface is used to collect array chunks and place them into a resource
-/// (e.g. an array stream or file (`vx_array_sink_open_file`)).
-///
-/// ## Thread Safety
-///
-/// This struct is **not** thread-safe for concurrent operations. While the underlying
-/// `Sender` is thread-safe, the FFI wrapper should only be accessed from a single thread
-/// to avoid race conditions between `push` and `close` operations. The `close` operation
-/// consumes the sink, making any subsequent operations undefined behavior.
-///
-/// Multiple threads may safely hold pointers to the same sink, but only one thread should
-/// perform operations on it at a time, and coordination is required to ensure `close` is
-/// called exactly once after all `push` operations are complete.
-pub struct vx_array_sink {
-    sink: Sender<VortexResult<ArrayRef>>,
-    writer: Task<VortexResult<WriteSummary>>,
+/// vx_writer can be used to write vx_arrays into a (possibly remote) file.
+pub struct vx_writer {
+    sender: Mutex<Option<Sender<VortexResult<ArrayRef>>>>,
+    writer: Mutex<Option<Task<VortexResult<WriteSummary>>>>,
     dtype: DType,
 }
 
-/// Opens a writable array stream, where sink is used to push values into the stream.
-/// To close the stream close the sink with `vx_array_sink_close`.
-/// "path" is copied.
+/// Open a writer for a file at "path". "path" is copied.
+///
+/// "dtype" is used to validate pushed arrays so they would all have the same
+/// schema.
+///
+/// "concurrent_array_limit" is the limit on the number of arrays that are
+/// processed concurrently. This limits RAM used for processing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_array_sink_open_file(
+pub unsafe extern "C-unwind" fn vx_writer_open(
     session: *const vx_session,
     path: vx_view,
     dtype: *const vx_dtype,
+    concurrent_array_limit: usize,
     error_out: *mut *mut vx_error,
-) -> *mut vx_array_sink {
+) -> *mut vx_writer {
+    let session = vx_session::as_ref(session).clone();
     try_or_default(error_out, || {
-        let session = vx_session::as_ref(session).clone();
-
-        if path.ptr.is_null() {
-            vortex_bail!("null path");
-        }
+        vortex_ensure!(!path.ptr.is_null());
         let path = unsafe { path.as_str() }?.to_string();
 
         let file_dtype = vx_dtype::as_ref(dtype);
-        // The channel size 32 was chosen arbitrarily.
-        let (sink, rx) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(concurrent_array_limit);
         let dtype = file_dtype.clone();
-        let array_stream = ArrayStreamAdapter::new(dtype.clone(), rx.into_stream());
+        let array_stream = ArrayStreamAdapter::new(dtype.clone(), receiver.into_stream());
 
         let writer = session.handle().spawn(async move {
             let mut file = async_fs::File::create(path).await?;
             session.write_options().write(&mut file, array_stream).await
         });
 
-        Ok(Box::into_raw(Box::new(vx_array_sink {
-            sink,
-            writer,
+        Ok(Box::into_raw(Box::new(vx_writer {
+            sender: Mutex::new(Some(sender)),
+            writer: Mutex::new(Some(writer)),
             dtype,
         })))
     })
 }
 
-/// Push an array into a file sink.
-/// Does not take ownership of array.
+/// Push an array into a writer. Does not take ownership of array.
 ///
-/// Errors if array's DType doesn't match sink's DType.
+/// Array ordering across concurrent calls to this function is
+/// non-deterministic: vx_writer_push(array1) called concurrently with
+/// vx_writer_push(array2) may write array2 first.
+///
+/// Errors if array's dtype and writer's initialized dtype are different.
+/// Errors if writer has already been closed.
+///
+/// Thread safe.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_array_sink_push(
-    sink: *mut vx_array_sink,
+pub unsafe extern "C-unwind" fn vx_writer_push(
+    writer: *mut vx_writer,
     array: *const vx_array,
     error_out: *mut *mut vx_error,
 ) {
     try_or_default(error_out, || {
         vortex_ensure!(!array.is_null());
-        vortex_ensure!(!sink.is_null());
+        vortex_ensure!(!writer.is_null());
 
         let array = vx_array::as_ref(array);
-        let sink = unsafe { &mut *sink };
+        let writer = unsafe { &*writer };
 
         vortex_ensure!(
-            *array.dtype() == sink.dtype,
-            "array dtype {} does not match sink dtype {}",
+            *array.dtype() == writer.dtype,
+            "array dtype {} does not match writer dtype {}",
             array.dtype(),
-            sink.dtype
+            writer.dtype
         );
+
+        let mut sender = writer
+            .sender
+            .lock()
+            .clone()
+            .ok_or_else(|| vortex_err!("writer is closed"))?;
+
         RUNTIME
-            .block_on(sink.sink.send(Ok(array.clone())))
-            .map_err(|e| vortex_err!("Send error: {e}"))
+            .block_on(sender.send(Ok(array.clone())))
+            .map_err(|e| vortex_err!("Writer already closed: {e}"))
     })
 }
 
-/// Closes an array sink, must be called to ensure all the values pushed to the sink are written
-/// to the external resource.
+/// Close a writer.
+///
+/// Call to ensure all values pushed to the writer are indeed written. This
+/// call writes the footer to the file. If you don't call this function, file
+/// will be left corrupted.
+///
+/// If this function is called concurrently with vx_writer_push, it will block
+/// until vx_writer_push call finishes.
+///
+/// Thread-unsafe.
+///
+/// Errors if writer was already closed.
+///
+/// Use vx_writer_free to free the writer afterwards.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_array_sink_close(
-    sink: *mut vx_array_sink,
+pub unsafe extern "C-unwind" fn vx_writer_close(
+    writer: *mut vx_writer,
     error_out: *mut *mut vx_error,
 ) {
     try_or_default(error_out, || {
-        let vx_array_sink {
-            sink,
-            writer,
-            dtype: _,
-        } = *unsafe { Box::from_raw(sink) };
-        drop(sink);
+        vortex_ensure!(!writer.is_null());
+        let writer = unsafe { &*writer };
+
+        drop(writer.sender.lock().take());
+
+        let writer = writer
+            .writer
+            .lock()
+            .take()
+            .ok_or_else(|| vortex_err!("writer is closed"))?;
 
         RUNTIME.block_on(async {
             let _footer = writer.await?;
             VortexResult::Ok(())
-        })?;
-
-        Ok(())
+        })
     })
 }
 
-/// Abort an array sink. File footer is not written, and file is left invalid.
-/// Don't use sink after this call.
+/// Release the writer.
+///
+/// Thread unsafe. Must be called exactly once.
+///
+/// If vx_writer_close wasn't called before this function, file is left
+/// corrupted.
 #[unsafe(no_mangle)]
-pub unsafe extern "C-unwind" fn vx_array_sink_abort(sink: *mut vx_array_sink) {
-    if sink.is_null() {
+pub unsafe extern "C-unwind" fn vx_writer_free(writer: *mut vx_writer) {
+    if writer.is_null() {
         return;
     }
-    drop(unsafe { Box::from_raw(sink) });
+    drop(unsafe { Box::from_raw(writer) });
 }
 
 #[cfg(test)]
@@ -178,7 +190,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_sink_basic_workflow() {
+    fn test_writer_basic() {
         unsafe {
             let session = vx_session_new();
 
@@ -189,22 +201,20 @@ mod tests {
             let vx_dtype_ptr = vx_dtype::new(Arc::new(dtype));
 
             let mut error = std::ptr::null_mut();
-            let sink = vx_array_sink_open_file(session, path, vx_dtype_ptr, &raw mut error);
+            let writer = vx_writer_open(session, path, vx_dtype_ptr, &raw mut error);
             assert!(error.is_null());
-            assert!(!sink.is_null());
+            assert!(!writer.is_null());
 
-            // Create and push an array
             let array = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
             let vx_array_ptr = vx_array::new(Arc::new(array.into_array()));
 
-            vx_array_sink_push(sink, vx_array_ptr, &raw mut error);
+            vx_writer_push(writer, vx_array_ptr, &raw mut error);
             assert!(error.is_null());
 
-            // Close the sink
-            vx_array_sink_close(sink, &raw mut error);
+            vx_writer_close(writer, &raw mut error);
             assert!(error.is_null());
 
-            // Cleanup
+            vx_writer_free(writer);
             vx_array_free(vx_array_ptr);
             vx_dtype_free(vx_dtype_ptr);
             vx_session_free(session);
@@ -213,7 +223,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_sink_multiple_arrays() {
+    fn test_writer_multiple_arrays() {
         unsafe {
             let session = vx_session_new();
 
@@ -224,10 +234,9 @@ mod tests {
             let vx_dtype_ptr = vx_dtype::new(Arc::new(dtype));
 
             let mut error = std::ptr::null_mut();
-            let sink = vx_array_sink_open_file(session, path, vx_dtype_ptr, &raw mut error);
+            let writer = vx_writer_open(session, path, vx_dtype_ptr, &raw mut error);
             assert!(error.is_null());
 
-            // Push multiple arrays
             for i in 0..3 {
                 let start = i * 3;
                 let array = PrimitiveArray::new(
@@ -236,14 +245,15 @@ mod tests {
                 );
                 let vx_array_ptr = vx_array::new(Arc::new(array.into_array()));
 
-                vx_array_sink_push(sink, vx_array_ptr, &raw mut error);
+                vx_writer_push(writer, vx_array_ptr, &raw mut error);
                 assert!(error.is_null());
 
                 vx_array_free(vx_array_ptr);
             }
 
-            vx_array_sink_close(sink, &raw mut error);
+            vx_writer_close(writer, &raw mut error);
             assert!(error.is_null());
+            vx_writer_free(writer);
 
             vx_dtype_free(vx_dtype_ptr);
             vx_session_free(session);
@@ -252,7 +262,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_sink_invalid_path() {
+    fn test_writer_invalid_path() {
         unsafe {
             let session = vx_session_new();
 
@@ -262,27 +272,23 @@ mod tests {
             let vx_dtype_ptr = vx_dtype::new(Arc::new(dtype));
 
             let mut error = std::ptr::null_mut();
-            let sink = vx_array_sink_open_file(session, invalid_path, vx_dtype_ptr, &raw mut error);
+            let writer = vx_writer_open(session, invalid_path, vx_dtype_ptr, &raw mut error);
 
-            // The sink creation may succeed but close should fail due to invalid path
-            if !sink.is_null() {
-                // Push an array
+            // Creation may succeed but close should fail due to invalid path
+            if !writer.is_null() {
                 let array = PrimitiveArray::new(buffer![1i32], Validity::NonNullable);
                 let vx_array_ptr = vx_array::new(Arc::new(array.into_array()));
-                vx_array_sink_push(sink, vx_array_ptr, &raw mut error);
+                vx_writer_push(writer, vx_array_ptr, &raw mut error);
                 vx_array_free(vx_array_ptr);
 
-                // Close should fail due to invalid path
-                vx_array_sink_close(sink, &raw mut error);
+                vx_writer_close(writer, &raw mut error);
                 // Either error is set or operation succeeds (depends on filesystem)
                 if !error.is_null() {
                     vx_error_free(error);
                 }
-            } else {
-                // Sink creation failed, which is also valid
-                if !error.is_null() {
-                    vx_error_free(error);
-                }
+                vx_writer_free(writer);
+            } else if !error.is_null() {
+                vx_error_free(error);
             }
 
             vx_dtype_free(vx_dtype_ptr);
@@ -292,7 +298,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_sink_abort() {
+    fn test_writer_free() {
         let dtype = DType::Primitive(vortex::dtype::PType::I32, false.into());
         let array = PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::NonNullable);
 
@@ -304,15 +310,15 @@ mod tests {
             let dtype = vx_dtype::new(Arc::new(dtype));
 
             let mut error = std::ptr::null_mut();
-            let sink = vx_array_sink_open_file(session, path, dtype, &raw mut error);
+            let writer = vx_writer_open(session, path, dtype, &raw mut error);
             assert!(error.is_null());
 
             let array = vx_array::new(Arc::new(array.into_array()));
-            vx_array_sink_push(sink, array, &raw mut error);
+            vx_writer_push(writer, array, &raw mut error);
             assert!(error.is_null());
             vx_array_free(array);
 
-            vx_array_sink_abort(sink);
+            vx_writer_free(writer);
 
             let opts = vx_data_source_options {
                 paths: &raw const path,
@@ -330,7 +336,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_sink_null_path() {
+    fn test_writer_null_path() {
         unsafe {
             let session = vx_session_new();
 
@@ -338,14 +344,55 @@ mod tests {
             let vx_dtype_ptr = vx_dtype::new(Arc::new(dtype));
 
             let mut error = std::ptr::null_mut();
-            // This should return null and set error due to null path
-            let sink =
-                vx_array_sink_open_file(session, vx_view::null(), vx_dtype_ptr, &raw mut error);
+            let writer = vx_writer_open(session, vx_view::null(), vx_dtype_ptr, &raw mut error);
 
-            assert!(sink.is_null());
+            assert!(writer.is_null());
             assert!(!error.is_null());
 
             vx_error_free(error);
+            vx_dtype_free(vx_dtype_ptr);
+            vx_session_free(session);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_writer_push_after_close() {
+        unsafe {
+            let session = vx_session_new();
+
+            let temp_file = NamedTempFile::new().unwrap();
+            let path = vx_view::from_str(temp_file.path().to_str().unwrap());
+
+            let dtype = DType::Primitive(vortex::dtype::PType::I32, false.into());
+            let vx_dtype_ptr = vx_dtype::new(Arc::new(dtype));
+
+            let mut error = std::ptr::null_mut();
+            let writer = vx_writer_open(session, path, vx_dtype_ptr, &raw mut error);
+            assert!(error.is_null());
+
+            let array = PrimitiveArray::new(buffer![1i32], Validity::NonNullable);
+            let vx_array_ptr = vx_array::new(Arc::new(array.into_array()));
+
+            vx_writer_push(writer, vx_array_ptr, &raw mut error);
+            assert!(error.is_null());
+
+            vx_writer_close(writer, &raw mut error);
+            assert!(error.is_null());
+
+            vx_writer_push(writer, vx_array_ptr, &raw mut error);
+            assert!(!error.is_null());
+            let message = crate::error::vx_error_message(error);
+            assert!(message.as_str().unwrap().contains("closed"));
+            vx_error_free(error);
+
+            vx_writer_close(writer, &raw mut error);
+            assert!(!error.is_null());
+            vx_error_free(error);
+
+            vx_writer_free(writer);
+
+            vx_array_free(vx_array_ptr);
             vx_dtype_free(vx_dtype_ptr);
             vx_session_free(session);
         }

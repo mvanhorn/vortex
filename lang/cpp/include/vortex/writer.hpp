@@ -18,10 +18,13 @@ namespace vortex {
  *
  * finish() writes the footer and finalizes the file.
  * Not calling finish() leaves file corrupted.
+ *
+ * Writer methods are thread-safe.
  */
 class Writer {
 public:
-    static Writer open(const Session &session, std::string_view path, const DataType &dtype);
+    static Writer
+    open(const Session &session, std::string_view path, const DataType &dtype, size_t concurrent_array_limit);
 
     Writer(const Writer &) = delete;
     Writer &operator=(const Writer &) = delete;
@@ -41,12 +44,12 @@ public:
     void finish();
 
 private:
-    explicit Writer(vx_array_sink *sink) : handle_(sink) {
+    explicit Writer(vx_writer *writer) : handle_(writer) {
     }
 
     struct Deleter {
-        void operator()(vx_array_sink *ptr) const noexcept;
+        void operator()(vx_writer *ptr) const noexcept;
     };
-    std::unique_ptr<vx_array_sink, Deleter> handle_;
+    std::unique_ptr<vx_writer, Deleter> handle_;
 };
 } // namespace vortex

@@ -18,14 +18,20 @@ using detail::Access;
 using detail::throw_on_error;
 using detail::to_view;
 
-void Writer::Deleter::operator()(vx_array_sink *ptr) const noexcept {
-    vx_array_sink_abort(ptr);
+void Writer::Deleter::operator()(vx_writer *ptr) const noexcept {
+    vx_writer_free(ptr);
 }
 
-Writer Writer::open(const Session &session, std::string_view path, const DataType &dtype) {
+Writer Writer::open(const Session &session,
+                    std::string_view path,
+                    const DataType &dtype,
+                    size_t concurrent_array_limit) {
     vx_error *error = nullptr;
-    vx_array_sink *sink =
-        vx_array_sink_open_file(Access::c_ptr(session), to_view(path), Access::c_ptr(dtype), &error);
+    vx_writer *sink = vx_writer_open(Access::c_ptr(session),
+                                     to_view(path),
+                                     Access::c_ptr(dtype),
+                                     concurrent_array_limit,
+                                     &error);
     throw_on_error(error);
     return Writer(sink);
 }
@@ -35,7 +41,7 @@ void Writer::push(const Array &array) {
         throw VortexException("null handle_", ErrorCode::InvalidArgument);
     }
     vx_error *error = nullptr;
-    vx_array_sink_push(handle_.get(), Access::c_ptr(array), &error);
+    vx_writer_push(handle_.get(), Access::c_ptr(array), &error);
     throw_on_error(error);
 }
 
@@ -44,7 +50,8 @@ void Writer::finish() {
         throw VortexException("finish() called twice", ErrorCode::InvalidArgument);
     }
     vx_error *error = nullptr;
-    vx_array_sink_close(handle_.release(), &error);
+    vx_writer_close(handle_.get(), &error);
+    handle_.reset();
     throw_on_error(error);
 }
 } // namespace vortex

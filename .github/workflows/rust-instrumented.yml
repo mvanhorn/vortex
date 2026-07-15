@@ -252,6 +252,7 @@ jobs:
           ./vortex-ffi/build/examples/dtype '*.vortex'
           ./vortex-ffi/build/examples/scan '*.vortex'
           ./vortex-ffi/build/examples/scan_to_arrow '*.vortex'
+          ./vortex-ffi/build/examples/parallel_write -j 16 '1.vortex'
 
   miri:
     name: "Rust tests (miri)"

@@ -106,7 +106,7 @@ int main(int argc, char *argv[]) {
     const vx_dtype *dtype = sample_dtype();
 
     vx_error *error = NULL;
-    vx_array_sink *sink = vx_array_sink_open_file(session, vx_view_from_cstr(output), dtype, &error);
+    vx_writer *writer = vx_writer_open(session, vx_view_from_cstr(output), dtype, 32, &error);
 
     vx_dtype_free(dtype);
     if (error != NULL) {
@@ -118,24 +118,27 @@ int main(int argc, char *argv[]) {
     if (array == NULL) {
         // We already have an error, so we can ignore a potential error
         // from this operation
-        vx_array_sink_close(sink, &error);
+        vx_writer_close(writer, &error);
+        vx_writer_free(writer);
         vx_session_free(session);
         return 1;
     }
 
-    vx_array_sink_push(sink, array, &error);
+    vx_writer_push(writer, array, &error);
     if (error != NULL) {
-        vx_array_sink_close(sink, &error);
+        vx_writer_close(writer, &error);
+        vx_writer_free(writer);
         vx_session_free(session);
         return 1;
     }
     vx_array_free(array);
 
-    vx_array_sink_close(sink, &error);
+    vx_writer_close(writer, &error);
     if (error != NULL) {
         print_error("Error closing output sink", error);
         vx_error_free(error);
     }
+    vx_writer_free(writer);
 
     vx_session_free(session);
     return 0;

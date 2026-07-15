@@ -10137,6 +10137,7 @@ dependencies = [
  "cbindgen",
  "futures",
  "mimalloc",
+ "parking_lot",
  "paste",
  "rand 0.10.2",
  "tempfile",

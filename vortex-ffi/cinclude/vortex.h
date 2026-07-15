@@ -474,23 +474,6 @@ typedef struct vx_array vx_array;
 typedef struct vx_array_iterator vx_array_iterator;
 
 /**
- * The `sink` interface is used to collect array chunks and place them into a resource
- * (e.g. an array stream or file (`vx_array_sink_open_file`)).
- *
- * ## Thread Safety
- *
- * This struct is **not** thread-safe for concurrent operations. While the underlying
- * `Sender` is thread-safe, the FFI wrapper should only be accessed from a single thread
- * to avoid race conditions between `push` and `close` operations. The `close` operation
- * consumes the sink, making any subsequent operations undefined behavior.
- *
- * Multiple threads may safely hold pointers to the same sink, but only one thread should
- * perform operations on it at a time, and coordination is required to ensure `close` is
- * called exactly once after all `push` operations are complete.
- */
-typedef struct vx_array_sink vx_array_sink;
-
-/**
  * A reference to one or more (possibly remote) paths.
  * Creating vx_data_source opens the first matched path to read the schema.
  * All other I/O is deferred until a scan is requested. Multiple scans may
@@ -524,11 +507,6 @@ typedef struct vx_error vx_error;
  * input values must be freed by the caller.
  */
 typedef struct vx_expression vx_expression;
-
-/**
- * A handle to a Vortex file encapsulating the footer and logic for instantiating a reader.
- */
-typedef struct vx_file vx_file;
 
 /**
  * A partition is an independent unit of work. Call vx_partition_next repeatedly to
@@ -568,6 +546,11 @@ typedef struct vx_struct_fields vx_struct_fields;
  * Builder for creating a [`vx_struct_fields`].
  */
 typedef struct vx_struct_fields_builder vx_struct_fields_builder;
+
+/**
+ * vx_writer can be used to write vx_arrays into a (possibly remote) file.
+ */
+typedef struct vx_writer vx_writer;
 
 /**
  * Array validity descriptor used by C FFI constructors.
@@ -1620,44 +1603,6 @@ vx_session *vx_session_new(void);
 vx_session *vx_session_clone(const vx_session *session);
 
 /**
- * Increase reference count on vx_file
- */
-const vx_file *vx_file_clone(const vx_file *ptr);
-
-/**
- * Decrease reference count on vx_file or free if there are no other references
- */
-void vx_file_free(const vx_file *ptr);
-
-/**
- * Opens a writable array stream, where sink is used to push values into the stream.
- * To close the stream close the sink with `vx_array_sink_close`.
- * "path" is copied.
- */
-vx_array_sink *
-vx_array_sink_open_file(const vx_session *session, vx_view path, const vx_dtype *dtype, vx_error **error_out);
-
-/**
- * Push an array into a file sink.
- * Does not take ownership of array.
- *
- * Errors if array's DType doesn't match sink's DType.
- */
-void vx_array_sink_push(vx_array_sink *sink, const vx_array *array, vx_error **error_out);
-
-/**
- * Closes an array sink, must be called to ensure all the values pushed to the sink are written
- * to the external resource.
- */
-void vx_array_sink_close(vx_array_sink *sink, vx_error **error_out);
-
-/**
- * Abort an array sink. File footer is not written, and file is left invalid.
- * Don't use sink after this call.
- */
-void vx_array_sink_abort(vx_array_sink *sink);
-
-/**
  * Free a vx_struct_column_builder
  */
 void vx_struct_column_builder_free(const vx_struct_column_builder *ptr);
@@ -1759,6 +1704,63 @@ void vx_struct_fields_builder_add_field(vx_struct_fields_builder *builder,
  * Takes ownership of the `builder`.
  */
 vx_struct_fields *vx_struct_fields_builder_finalize(vx_struct_fields_builder *builder);
+
+/**
+ * Open a writer for a file at "path". "path" is copied.
+ *
+ * "dtype" is used to validate pushed arrays so they would all have the same
+ * schema.
+ *
+ * "concurrent_array_limit" is the limit on the number of arrays that are
+ * processed concurrently. This limits RAM used for processing.
+ */
+vx_writer *vx_writer_open(const vx_session *session,
+                          vx_view path,
+                          const vx_dtype *dtype,
+                          size_t concurrent_array_limit,
+                          vx_error **error_out);
+
+/**
+ * Push an array into a writer. Does not take ownership of array.
+ *
+ * Array ordering across concurrent calls to this function is
+ * non-deterministic: vx_writer_push(array1) called concurrently with
+ * vx_writer_push(array2) may write array2 first.
+ *
+ * Errors if array's dtype and writer's initialized dtype are different.
+ * Errors if writer has already been closed.
+ *
+ * Thread safe.
+ */
+void vx_writer_push(vx_writer *writer, const vx_array *array, vx_error **error_out);
+
+/**
+ * Close a writer.
+ *
+ * Call to ensure all values pushed to the writer are indeed written. This
+ * call writes the footer to the file. If you don't call this function, file
+ * will be left corrupted.
+ *
+ * If this function is called concurrently with vx_writer_push, it will block
+ * until vx_writer_push call finishes.
+ *
+ * Thread-unsafe.
+ *
+ * Errors if writer was already closed.
+ *
+ * Use vx_writer_free to free the writer afterwards.
+ */
+void vx_writer_close(vx_writer *writer, vx_error **error_out);
+
+/**
+ * Release the writer.
+ *
+ * Thread unsafe. Must be called exactly once.
+ *
+ * If vx_writer_close wasn't called before this function, file is left
+ * corrupted.
+ */
+void vx_writer_free(vx_writer *writer);
 
 #ifdef __cplusplus
 } // extern "C"

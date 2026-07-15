@@ -18,6 +18,7 @@ using FFI_ArrowSchema = ArrowSchema;
 #include <vortex.h>
 
 #include "common.h"
+#include "temp_path.hpp"
 
 namespace fs = std::filesystem;
 using namespace std::string_literals;
@@ -27,31 +28,6 @@ using nanoarrow::UniqueArray;
 using nanoarrow::UniqueArrayStream;
 using nanoarrow::UniqueArrayView;
 using nanoarrow::UniqueSchema;
-
-struct TempPath : fs::path {
-    TempPath() = default;
-    explicit TempPath(fs::path p) : fs::path(std::move(p)) {
-    }
-
-    TempPath(const TempPath &) = delete;
-    TempPath &operator=(const TempPath &) = delete;
-
-    TempPath(TempPath &&other) noexcept : fs::path(std::move(other)) {
-    }
-    TempPath &operator=(TempPath &&other) noexcept {
-        if (this != &other) {
-            fs::remove(*this);
-            fs::path::operator=(std::move(other));
-        }
-        return *this;
-    }
-
-    ~TempPath() {
-        if (!empty()) {
-            fs::remove(*this);
-        }
-    }
-};
 
 // StructArray { age=u8, height=u16? }
 [[nodiscard]] const vx_dtype *sample_dtype() {
@@ -167,18 +143,21 @@ UniqueArrayStream sample_array_stream() {
     };
 
     vx_error *error = nullptr;
-    vx_array_sink *sink = vx_array_sink_open_file(session, vx_view_from_cstr(path.c_str()), dtype, &error);
-    REQUIRE(sink != nullptr);
+    vx_writer *writer = vx_writer_open(session, vx_view_from_cstr(path.c_str()), dtype, 32, &error);
+    REQUIRE(writer != nullptr);
     require_no_error(error);
+    defer {
+        vx_writer_free(writer);
+    };
 
     const vx_array *array = sample_array();
     defer {
         vx_array_free(array);
     };
-    vx_array_sink_push(sink, array, &error);
+    vx_writer_push(writer, array, &error);
     require_no_error(error);
 
-    vx_array_sink_close(sink, &error);
+    vx_writer_close(writer, &error);
     require_no_error(error);
 
     INFO("Written vortex file "s + path.generic_string());
