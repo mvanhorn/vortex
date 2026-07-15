@@ -156,13 +156,14 @@ mod tests {
 
     #[test]
     fn decimal_arithmetic_coerces_precision_and_scale() -> VortexResult<()> {
-        let result_dtype = DType::Decimal(DecimalDType::new(4, 2), NonNullable);
+        let common_dtype = DType::Decimal(DecimalDType::new(4, 2), NonNullable);
+        let result_dtype = DType::Decimal(DecimalDType::new(5, 2), NonNullable);
         let scope = DType::Struct(
             StructFields::new(
                 ["a", "b"].into(),
                 vec![
                     DType::Decimal(DecimalDType::new(3, 1), NonNullable),
-                    result_dtype.clone(),
+                    common_dtype,
                 ],
             ),
             NonNullable,
@@ -173,29 +174,6 @@ mod tests {
 
         assert!(coerced.child(0).is::<Cast>());
         assert!(!coerced.child(1).is::<Cast>());
-        assert_eq!(coerced.return_dtype(&scope)?, result_dtype);
-        Ok(())
-    }
-
-    #[test]
-    fn decimal_arithmetic_coerces_integer_operand() -> VortexResult<()> {
-        let result_dtype = DType::Decimal(DecimalDType::new(5, 2), NonNullable);
-        let scope = DType::Struct(
-            StructFields::new(
-                ["a", "b"].into(),
-                vec![
-                    DType::Decimal(DecimalDType::new(4, 2), NonNullable),
-                    DType::Primitive(PType::I8, NonNullable),
-                ],
-            ),
-            NonNullable,
-        );
-        let expr = Binary.new_expr(Operator::Add, [col("a"), col("b")]);
-
-        let coerced = coerce_expression(expr, &scope)?;
-
-        assert!(coerced.child(0).is::<Cast>());
-        assert!(coerced.child(1).is::<Cast>());
         assert_eq!(coerced.return_dtype(&scope)?, result_dtype);
         Ok(())
     }

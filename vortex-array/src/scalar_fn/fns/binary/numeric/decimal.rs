@@ -3,10 +3,10 @@
 
 //! Native execution of the arithmetic operators over decimal arrays.
 //!
-//! Both operands share a logical [`DecimalDType`] (equal precision and scale) and the result
-//! keeps that dtype: fixed-point arithmetic at the shared scale. Add and Sub apply directly to
-//! the unscaled stored integers and are exact; Mul and Div require rescaling and are not yet
-//! implemented.
+//! Both operands share a logical [`DecimalDType`] (equal precision and scale). Add and Sub apply
+//! directly to the unscaled stored integers and are exact at that shared scale. The result reserves
+//! one additional precision digit for a carry, capped at Vortex's maximum decimal precision. Mul
+//! and Div require rescaling and are not yet implemented.
 //!
 //! Lanes execute in a working width chosen so that in-precision inputs cannot spuriously
 //! overflow an intermediate value. An operation that overflows the result precision on a valid
@@ -25,6 +25,7 @@ use super::CheckedValues;
 use super::check_numeric_errors;
 use super::checked_all_lanes;
 use super::checked_valid_lanes;
+use super::decimal_add_sub_result_dtype;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
@@ -54,10 +55,11 @@ pub(super) fn execute_numeric_decimal(
     let DType::Decimal(decimal_dtype, _) = lhs.dtype() else {
         vortex_bail!("expected a decimal dtype, got {}", lhs.dtype());
     };
-    let decimal_dtype = *decimal_dtype;
-    let result_dtype = lhs
-        .dtype()
-        .with_nullability(lhs.dtype().nullability() | rhs.dtype().nullability());
+    let result_decimal_dtype = decimal_add_sub_result_dtype(*decimal_dtype);
+    let result_dtype = DType::Decimal(
+        result_decimal_dtype,
+        lhs.dtype().nullability() | rhs.dtype().nullability(),
+    );
 
     let lhs = DecimalOperand::try_new(lhs, ctx)?;
     let rhs = DecimalOperand::try_new(rhs, ctx)?;
@@ -67,82 +69,61 @@ pub(super) fn execute_numeric_decimal(
     let validity = lhs.validity().and(rhs.validity())?;
     let valid_rows = validity.execute_mask(len, ctx)?;
 
-    let work = working_type(decimal_dtype);
-    let output = DecimalType::smallest_decimal_value_type(&decimal_dtype);
-    match (work, output) {
-        (DecimalType::I8, DecimalType::I8) => execute_decimal_at_widths::<i8, i8>(
+    match DecimalType::smallest_decimal_value_type(&result_decimal_dtype) {
+        DecimalType::I8 => execute_decimal_at_widths::<i8, i8>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I16, DecimalType::I8) => execute_decimal_at_widths::<i16, i8>(
+        DecimalType::I16 => execute_decimal_at_widths::<i16, i16>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I16, DecimalType::I16) => execute_decimal_at_widths::<i16, i16>(
+        DecimalType::I32 => execute_decimal_at_widths::<i32, i32>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I32, DecimalType::I32) => execute_decimal_at_widths::<i32, i32>(
+        DecimalType::I64 => execute_decimal_at_widths::<i64, i64>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I64, DecimalType::I64) => execute_decimal_at_widths::<i64, i64>(
+        DecimalType::I128 => execute_decimal_at_widths::<i128, i128>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I128, DecimalType::I128) => execute_decimal_at_widths::<i128, i128>(
+        DecimalType::I256 => execute_decimal_at_widths::<i256, i256>(
             &lhs,
             &rhs,
             op,
-            decimal_dtype,
+            result_decimal_dtype,
             &result_dtype,
             validity,
             &valid_rows,
         ),
-        (DecimalType::I256, DecimalType::I128) => execute_decimal_at_widths::<i256, i128>(
-            &lhs,
-            &rhs,
-            op,
-            decimal_dtype,
-            &result_dtype,
-            validity,
-            &valid_rows,
-        ),
-        (DecimalType::I256, DecimalType::I256) => execute_decimal_at_widths::<i256, i256>(
-            &lhs,
-            &rhs,
-            op,
-            decimal_dtype,
-            &result_dtype,
-            validity,
-            &valid_rows,
-        ),
-        _ => vortex_bail!("unsupported decimal working/output width combination: {work}/{output}"),
     }
 }
 
@@ -195,33 +176,6 @@ impl DecimalOperand {
             Self::Array { validity, .. } | Self::Constant { validity, .. } => validity.clone(),
             Self::Null(_) => Validity::AllInvalid,
         }
-    }
-}
-
-/// Choose the smallest lane width that can represent every sum or difference of two valid inputs.
-fn working_type(dtype: DecimalDType) -> DecimalType {
-    let precision = dtype.precision() as usize;
-    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[precision];
-    let max_result = max
-        .checked_add(&max)
-        .vortex_expect("the sum of two valid decimal values must fit in i256");
-    smallest_value_type(&DecimalValue::from(max_result))
-}
-
-/// The smallest decimal value type that can represent `value`, regardless of its stored width.
-fn smallest_value_type(value: &DecimalValue) -> DecimalType {
-    if value.cast::<i8>().is_some() {
-        DecimalType::I8
-    } else if value.cast::<i16>().is_some() {
-        DecimalType::I16
-    } else if value.cast::<i32>().is_some() {
-        DecimalType::I32
-    } else if value.cast::<i64>().is_some() {
-        DecimalType::I64
-    } else if value.cast::<i128>().is_some() {
-        DecimalType::I128
-    } else {
-        DecimalType::I256
     }
 }
 
@@ -289,7 +243,7 @@ fn execute_decimal_at_widths<W, O>(
     lhs: &DecimalOperand,
     rhs: &DecimalOperand,
     op: NumericOperator,
-    decimal_dtype: DecimalDType,
+    result_decimal_dtype: DecimalDType,
     result_dtype: &DType,
     validity: Validity,
     valid_rows: &Mask,
@@ -303,7 +257,7 @@ where
         NumericOperator::Add => execute_decimal_typed::<W, O, DecimalAdd>(
             lhs,
             rhs,
-            decimal_dtype,
+            result_decimal_dtype,
             result_dtype,
             validity,
             valid_rows,
@@ -311,7 +265,7 @@ where
         NumericOperator::Sub => execute_decimal_typed::<W, O, DecimalSub>(
             lhs,
             rhs,
-            decimal_dtype,
+            result_decimal_dtype,
             result_dtype,
             validity,
             valid_rows,
@@ -326,7 +280,7 @@ where
 fn execute_decimal_typed<W, O, Op>(
     lhs: &DecimalOperand,
     rhs: &DecimalOperand,
-    decimal_dtype: DecimalDType,
+    result_decimal_dtype: DecimalDType,
     result_dtype: &DType,
     validity: Validity,
     valid_rows: &Mask,
@@ -338,7 +292,7 @@ where
     Op: CheckedDecimalOp,
 {
     let len = lhs.len();
-    let plan = DecimalOpPlan::<W>::new(decimal_dtype);
+    let plan = DecimalOpPlan::<W>::new(result_decimal_dtype);
 
     let checked = match (lhs, rhs) {
         (DecimalOperand::Array { values: lhs, .. }, DecimalOperand::Array { values: rhs, .. }) => {
@@ -374,7 +328,7 @@ where
             return Ok(ConstantArray::new(
                 Scalar::decimal(
                     DecimalValue::from(value),
-                    decimal_dtype,
+                    result_decimal_dtype,
                     result_dtype.nullability(),
                 ),
                 len,
@@ -389,7 +343,7 @@ where
 
     Ok(DecimalArray::new(
         checked.values,
-        decimal_dtype,
+        result_decimal_dtype,
         validity.union_nullability(result_dtype.nullability()),
     )
     .into_array())

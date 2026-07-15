@@ -6,6 +6,8 @@
 //!
 //! [`Binary`]: super::Binary
 
+use super::decimal_add_sub_result_dtype;
+
 mod decimal;
 mod primitive;
 #[cfg(test)]
@@ -50,9 +52,15 @@ pub(crate) fn execute_numeric(
     }
 
     if lhs.is_empty() {
-        let result_dtype = lhs
-            .dtype()
-            .with_nullability(lhs.dtype().nullability() | rhs.dtype().nullability());
+        let nullability = lhs.dtype().nullability() | rhs.dtype().nullability();
+        let result_dtype = match lhs.dtype() {
+            DType::Primitive(..) => lhs.dtype().with_nullability(nullability),
+            DType::Decimal(decimal_dtype, _) => {
+                debug_assert!(matches!(op, NumericOperator::Add | NumericOperator::Sub));
+                DType::Decimal(decimal_add_sub_result_dtype(*decimal_dtype), nullability)
+            }
+            dtype => vortex_bail!("numeric operator is not supported for dtype {}", dtype),
+        };
         return Ok(Canonical::empty(&result_dtype).into_array());
     }
 

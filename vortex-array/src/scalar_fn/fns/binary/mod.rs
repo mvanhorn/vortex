@@ -17,6 +17,8 @@ use vortex_session::registry::CachedId;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
+use crate::dtype::DecimalDType;
+use crate::dtype::MAX_PRECISION;
 use crate::dtype::Nullability;
 use crate::expr::and;
 use crate::expr::expression::Expression;
@@ -47,6 +49,14 @@ use crate::scalar::Scalar;
 
 #[derive(Clone)]
 pub struct Binary;
+
+/// Derive the result type for Add/Sub over operands that already share a decimal dtype.
+pub(crate) fn decimal_add_sub_result_dtype(input: DecimalDType) -> DecimalDType {
+    DecimalDType::new(
+        input.precision().saturating_add(1).min(MAX_PRECISION),
+        input.scale(),
+    )
+}
 
 impl ScalarFnVTable for Binary {
     type Options = Operator;
@@ -118,11 +128,17 @@ impl ScalarFnVTable for Binary {
         let rhs = &arg_dtypes[1];
 
         if operator.is_arithmetic() {
-            // Decimal Mul/Div need rescaling support and are not yet implemented.
-            let decimal_supported =
-                lhs.is_decimal() && matches!(operator, Operator::Add | Operator::Sub);
-            if (lhs.is_primitive() || decimal_supported) && lhs.eq_ignore_nullability(rhs) {
+            if lhs.is_primitive() && lhs.eq_ignore_nullability(rhs) {
                 return Ok(lhs.with_nullability(lhs.nullability() | rhs.nullability()));
+            }
+            if let DType::Decimal(decimal_dtype, _) = lhs
+                && matches!(operator, Operator::Add | Operator::Sub)
+                && lhs.eq_ignore_nullability(rhs)
+            {
+                return Ok(DType::Decimal(
+                    decimal_add_sub_result_dtype(*decimal_dtype),
+                    lhs.nullability() | rhs.nullability(),
+                ));
             }
             vortex_bail!(
                 "incompatible types for arithmetic operation: {} {}",

@@ -5,6 +5,7 @@ use rstest::rstest;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 
+use super::decimal_add_sub_result_dtype;
 use crate::ArrayRef;
 use crate::IntoArray;
 use crate::RecursiveCanonical;
@@ -18,7 +19,9 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::DecimalType;
+use crate::dtype::NativeDecimalType;
 use crate::dtype::Nullability;
+use crate::dtype::i256;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::operators::Operator;
@@ -252,13 +255,14 @@ fn test_decimal_array_array(
 ) {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
+    let result_dtype = decimal_add_sub_result_dtype(dtype);
     let lhs = DecimalArray::from_iter::<i64, _>([900, 1000], dtype).into_array();
     let rhs = DecimalArray::from_iter::<i64, _>(rhs, dtype).into_array();
 
     let result = decimal_binary(lhs, rhs, op).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>(expected, dtype),
+        DecimalArray::from_iter::<i64, _>(expected, result_dtype),
         &mut ctx
     );
 }
@@ -273,7 +277,7 @@ fn test_decimal_mixed_storage_widths() {
     let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([300, 500], dtype),
+        DecimalArray::from_iter::<i64, _>([300, 500], decimal_add_sub_result_dtype(dtype)),
         &mut ctx
     );
 }
@@ -289,16 +293,20 @@ fn test_decimal_nullable_lanes() {
     let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_option_iter::<i64, _>([Some(150), None, Some(350)], dtype),
+        DecimalArray::from_option_iter::<i64, _>(
+            [Some(150), None, Some(350)],
+            decimal_add_sub_result_dtype(dtype),
+        ),
         &mut ctx
     );
 }
 
 #[test]
-fn test_decimal_overflow_on_valid_lane_errors() {
-    let dtype = DecimalDType::new(3, 0);
-    let lhs = DecimalArray::from_iter::<i16, _>([999], dtype).into_array();
-    let rhs = DecimalArray::from_iter::<i16, _>([2], dtype).into_array();
+fn test_decimal_max_precision_overflow_on_valid_lane_errors() {
+    let dtype = DecimalDType::new(76, 0);
+    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[76];
+    let lhs = DecimalArray::from_iter::<i256, _>([max], dtype).into_array();
+    let rhs = DecimalArray::from_iter::<i256, _>([i256::from_i128(1)], dtype).into_array();
 
     assert!(decimal_binary(lhs, rhs, Operator::Add).is_err());
 }
@@ -306,52 +314,62 @@ fn test_decimal_overflow_on_valid_lane_errors() {
 #[test]
 fn test_decimal_overflow_on_null_lane_ignored() {
     let mut ctx = array_session().create_execution_ctx();
-    let dtype = DecimalDType::new(3, 0);
-    // The null lane holds 999, so adding 500 overflows the precision there but is ignored.
-    let lhs = DecimalArray::new(
-        buffer![999i16, 1],
-        dtype,
-        Validity::from_iter([false, true]),
-    )
-    .into_array();
-    let rhs = decimal_constant(500i16, dtype, 2);
+    let dtype = DecimalDType::new(76, 0);
+    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[76];
+    let one = i256::from_i128(1);
+    // The null lane holds the maximum value, so adding one overflows there but is ignored.
+    let lhs = DecimalArray::new(buffer![max, one], dtype, Validity::from_iter([false, true]))
+        .into_array();
+    let rhs = decimal_constant(one, dtype, 2);
 
     let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_option_iter::<i16, _>([None, Some(501)], dtype),
+        DecimalArray::from_option_iter::<i256, _>([None, Some(i256::from_i128(2))], dtype,),
         &mut ctx
     );
 }
 
-/// A value can fit the storage width while violating the dtype precision: 60 + 60 fits an i8 but
-/// exceeds precision 2.
 #[test]
-fn test_decimal_precision_stricter_than_width() {
+fn test_decimal_add_reserves_carry_digit() {
+    let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(2, 0);
     let lhs = DecimalArray::from_iter::<i8, _>([60], dtype).into_array();
     let rhs = DecimalArray::from_iter::<i8, _>([60], dtype).into_array();
 
-    assert!(decimal_binary(lhs, rhs, Operator::Add).is_err());
+    let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
+    assert_arrays_eq!(
+        result,
+        DecimalArray::from_iter::<i16, _>([120], DecimalDType::new(3, 0)),
+        &mut ctx
+    );
 }
 
 #[rstest]
 #[case::precision_2(
     DecimalArray::from_iter::<i8, _>([10, 20], DecimalDType::new(2, 0)),
-    DecimalType::I8,
+    DecimalType::I16,
 )]
 #[case::precision_18(
     DecimalArray::from_iter::<i64, _>([10, 20], DecimalDType::new(18, 0)),
-    DecimalType::I64,
+    DecimalType::I128,
 )]
 #[case::precision_38(
     DecimalArray::from_iter::<i128, _>([10, 20], DecimalDType::new(38, 0)),
-    DecimalType::I128,
+    DecimalType::I256,
 )]
-fn test_decimal_result_uses_logical_storage_width(
+#[case::precision_76(
+    DecimalArray::from_iter::<i256, _>(
+        [i256::from_i128(10), i256::from_i128(20)],
+        DecimalDType::new(76, 0),
+    ),
+    DecimalType::I256,
+)]
+fn test_decimal_result_uses_widened_logical_storage_width(
     #[case] values: DecimalArray,
     #[case] expected_type: DecimalType,
 ) -> VortexResult<()> {
+    let expected_dtype = decimal_add_sub_result_dtype(values.decimal_dtype());
     let result = decimal_binary(
         values.clone().into_array(),
         values.into_array(),
@@ -360,18 +378,52 @@ fn test_decimal_result_uses_logical_storage_width(
     .execute::<DecimalArray>(&mut array_session().create_execution_ctx())?;
 
     assert_eq!(result.values_type(), expected_type);
+    assert_eq!(result.decimal_dtype(), expected_dtype);
+    Ok(())
+}
+
+#[test]
+fn test_decimal_precision_76_boundary() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let dtype = DecimalDType::new(76, 0);
+    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[76];
+    let zero = i256::from_i128(0);
+    let one = i256::from_i128(1);
+
+    let result = decimal_binary(
+        DecimalArray::from_iter::<i256, _>([max], dtype).into_array(),
+        DecimalArray::from_iter::<i256, _>([zero], dtype).into_array(),
+        Operator::Add,
+    )?;
+    assert_arrays_eq!(
+        result,
+        DecimalArray::from_iter::<i256, _>([max], dtype),
+        &mut ctx
+    );
+
+    let overflow = decimal_binary(
+        DecimalArray::from_iter::<i256, _>([max], dtype).into_array(),
+        DecimalArray::from_iter::<i256, _>([one], dtype).into_array(),
+        Operator::Add,
+    );
+    assert!(overflow.is_err());
     Ok(())
 }
 
 #[test]
 fn test_decimal_empty_constants_do_not_evaluate() -> VortexResult<()> {
-    let dtype = DecimalDType::new(3, 0);
-    let lhs = decimal_constant(999i16, dtype, 0);
-    let rhs = decimal_constant(1i16, dtype, 0);
+    let dtype = DecimalDType::new(76, 0);
+    let max = <i256 as NativeDecimalType>::MAX_BY_PRECISION[76];
+    let lhs = decimal_constant(max, dtype, 0);
+    let rhs = decimal_constant(i256::from_i128(1), dtype, 0);
 
     let result = decimal_binary(lhs, rhs, Operator::Add)?;
 
     assert!(result.is_empty());
+    assert_eq!(
+        result.dtype(),
+        &DType::Decimal(dtype, Nullability::NonNullable)
+    );
     Ok(())
 }
 
@@ -385,7 +437,7 @@ fn test_decimal_constant_lhs_non_commutative() {
     let result = decimal_binary(lhs, rhs, Operator::Sub).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([750, 600], dtype),
+        DecimalArray::from_iter::<i64, _>([750, 600], decimal_add_sub_result_dtype(dtype),),
         &mut ctx
     );
 }
@@ -404,7 +456,10 @@ fn test_decimal_nullable_constant_preserves_nullable_output() {
     let result = decimal_binary(values, constant, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_option_iter::<i64, _>([Some(150), Some(250)], dtype),
+        DecimalArray::from_option_iter::<i64, _>(
+            [Some(150), Some(250)],
+            decimal_add_sub_result_dtype(dtype),
+        ),
         &mut ctx
     );
 }
@@ -423,7 +478,7 @@ fn test_decimal_null_constant_yields_all_null() {
     let result = decimal_binary(values, null_constant, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_option_iter::<i64, _>([None, None], dtype),
+        DecimalArray::from_option_iter::<i64, _>([None, None], decimal_add_sub_result_dtype(dtype),),
         &mut ctx
     );
 }
@@ -440,7 +495,10 @@ fn test_decimal_constant_wider_than_array_storage() {
     let result = decimal_binary(values, constant, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([10_000_000_001, 10_000_000_002], dtype),
+        DecimalArray::from_iter::<i64, _>(
+            [10_000_000_001, 10_000_000_002],
+            decimal_add_sub_result_dtype(dtype),
+        ),
         &mut ctx
     );
 }
@@ -454,7 +512,7 @@ fn test_decimal_empty() {
     let result = decimal_binary(empty.clone(), empty, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([], dtype),
+        DecimalArray::from_iter::<i64, _>([], decimal_add_sub_result_dtype(dtype)),
         &mut ctx
     );
 }
@@ -469,7 +527,7 @@ fn test_decimal_constant_constant_folds() {
     let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([200, 200, 200], dtype),
+        DecimalArray::from_iter::<i64, _>([200, 200, 200], decimal_add_sub_result_dtype(dtype),),
         &mut ctx
     );
 }

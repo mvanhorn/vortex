@@ -49,6 +49,7 @@ use crate::scalar::DecimalValue;
 use crate::scalar::NumericOperator;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
+use crate::scalar_fn::fns::binary::decimal_add_sub_result_dtype;
 
 fn to_vec_of_scalar(array: &ArrayRef, ctx: &mut ExecutionCtx) -> Vec<Scalar> {
     // Not fast, but obviously correct
@@ -299,6 +300,8 @@ fn test_decimal_binary_numeric_with_scalar(
     let original_values = to_vec_of_scalar(&canonicalized_array, ctx);
 
     let scalar = Scalar::decimal(value, decimal_dtype, array.dtype().nullability());
+    let result_decimal_dtype = decimal_add_sub_result_dtype(decimal_dtype);
+    let result_dtype = DType::Decimal(result_decimal_dtype, array.dtype().nullability());
 
     // Decimal Mul/Div are not yet implemented.
     let operators = vec![NumericOperator::Add, NumericOperator::Sub];
@@ -321,7 +324,17 @@ fn test_decimal_binary_numeric_with_scalar(
                     } else {
                         (scalar.as_decimal(), x.as_decimal())
                     };
-                    lhs.checked_binary_numeric(&rhs, operator).map(Scalar::from)
+                    let (Some(lhs), Some(rhs)) = (lhs.decimal_value(), rhs.decimal_value()) else {
+                        return Some(Scalar::null(result_dtype.clone()));
+                    };
+                    let value = match operator {
+                        NumericOperator::Add => lhs.checked_add(&rhs),
+                        NumericOperator::Sub => lhs.checked_sub(&rhs),
+                        NumericOperator::Mul | NumericOperator::Div => unreachable!(),
+                    }?;
+                    value.fits_in_precision(result_decimal_dtype).then(|| {
+                        Scalar::decimal(value, result_decimal_dtype, result_dtype.nullability())
+                    })
                 })
                 .collect();
 
