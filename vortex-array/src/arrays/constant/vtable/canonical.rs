@@ -8,6 +8,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use crate::Canonical;
 use crate::ExecutionCtx;
@@ -149,16 +150,22 @@ pub(crate) fn constant_canonicalize(
                     .collect(),
                 None => {
                     assert!(matches!(validity, Validity::AllInvalid));
-                    // The struct is entirely null, so fields just need placeholder values with the
-                    // correct dtype. We use `default_value` which returns a zero for non-nullable
-                    // dtypes and null for nullable dtypes, preserving each field's nullability.
                     struct_dtype
                         .fields()
                         .map(|dt| {
-                            let scalar = Scalar::default_value(&dt);
-                            ConstantArray::new(scalar, array.len()).into_array()
+                            if array.is_empty() {
+                                return Ok(Canonical::empty(&dt).into_array());
+                            }
+
+                            let scalar = try_placeholder_scalar(&dt).ok_or_else(|| {
+                                vortex_err!(
+                                    "cannot canonicalize null constant struct: field dtype {dt} \
+                                     has no placeholder value"
+                                )
+                            })?;
+                            Ok(ConstantArray::new(scalar, array.len()).into_array())
                         })
-                        .collect()
+                        .collect::<VortexResult<Vec<_>>>()?
                 }
             };
             // SAFETY: Fields are constructed from the same struct scalar, all have same
@@ -202,6 +209,10 @@ fn constant_canonical_union(
     nullability: Nullability,
     len: usize,
 ) -> VortexResult<UnionArray> {
+    if len == 0 {
+        return Ok(UnionArray::empty(variants.clone(), nullability));
+    }
+
     let union = scalar.as_union();
     let selected = union.child_index().zip(union.value());
 
@@ -209,18 +220,21 @@ fn constant_canonical_union(
         .variants()
         .enumerate()
         .map(|(index, dtype)| {
-            let value = match selected {
-                Some((selected_child, selected_value)) if index == selected_child => {
+            let value = match &selected {
+                Some((selected_child, selected_value)) if index == *selected_child => {
                     selected_value.clone()
                 }
-                _ if matches!(&dtype, DType::Union(_, Nullability::NonNullable)) => {
-                    Scalar::zero_value(&dtype)
-                }
-                _ => Scalar::default_value(&dtype),
+                _ => try_placeholder_scalar(&dtype).ok_or_else(|| {
+                    vortex_err!(
+                        "cannot canonicalize constant union: unselected variant {} ({dtype}) has \
+                         no placeholder value",
+                        variants.names()[index]
+                    )
+                })?,
             };
-            ConstantArray::new(value, len).into_array()
+            Ok(ConstantArray::new(value, len).into_array())
         })
-        .collect::<Vec<_>>();
+        .collect::<VortexResult<Vec<_>>>()?;
 
     let type_id = match union.type_id() {
         Some(type_id) => Scalar::primitive(type_id, nullability),
@@ -232,6 +246,52 @@ fn constant_canonical_union(
         variants.clone(),
         children,
     )
+}
+
+/// Builds an arbitrary valid scalar for array positions ignored by a parent validity or type ID.
+/// This does not give the dtype a semantic default value.
+fn try_placeholder_scalar(dtype: &DType) -> Option<Scalar> {
+    if let Some(default) = Scalar::try_default_value(dtype) {
+        return Some(default);
+    }
+
+    match dtype {
+        DType::FixedSizeList(element_dtype, size, nullability) => {
+            let element = try_placeholder_scalar(element_dtype)?;
+            Some(Scalar::fixed_size_list(
+                Arc::clone(element_dtype),
+                vec![element; *size as usize],
+                *nullability,
+            ))
+        }
+        DType::Struct(fields, _) => {
+            let children = fields
+                .fields()
+                .map(|field| try_placeholder_scalar(&field))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Scalar::struct_(dtype.clone(), children))
+        }
+        DType::Union(variants, nullability) => {
+            variants
+                .variants()
+                .enumerate()
+                .find_map(|(index, child_dtype)| {
+                    let child = try_placeholder_scalar(&child_dtype)?;
+                    Scalar::union(
+                        variants.clone(),
+                        variants.child_index_to_tag(index),
+                        child,
+                        *nullability,
+                    )
+                    .ok()
+                })
+        }
+        DType::Extension(ext_dtype) => {
+            let storage = try_placeholder_scalar(ext_dtype.storage_dtype())?;
+            Some(Scalar::extension_ref(ext_dtype.clone(), storage))
+        }
+        _ => None,
+    }
 }
 
 fn constant_canonical_byte_view(
