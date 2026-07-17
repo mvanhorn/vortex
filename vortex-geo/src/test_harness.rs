@@ -180,6 +180,33 @@ pub(crate) fn multipolygon_column(multipolygons: Vec<MultiPolygonRings>) -> Vort
     )
 }
 
+/// A nullable `MultiPolygon` column: `None` rows are null (an empty-list placeholder in storage).
+pub(crate) fn nullable_multipolygon_column(
+    multipolygons: Vec<Option<MultiPolygonRings>>,
+) -> VortexResult<ArrayRef> {
+    let rows: Vec<MultiPolygonRings> = multipolygons
+        .iter()
+        .map(|row| row.clone().unwrap_or_default())
+        .collect();
+    let polygons: Vec<Vec<Vec<(f64, f64)>>> = rows.iter().flatten().cloned().collect();
+    let mut offsets = vec![0i32];
+    let mut len = 0usize;
+    for row in &rows {
+        len += row.len();
+        offsets.push(offset(len)?);
+    }
+    let storage = ListArray::try_new(
+        vertex_list_lists(&polygons)?,
+        PrimitiveArray::from_iter(offsets).into_array(),
+        Validity::from_iter(multipolygons.iter().map(Option::is_some)),
+    )?
+    .into_array();
+    geo_column::<MultiPolygon>(
+        storage,
+        multipolygon_storage_dtype(Dimension::Xy, Nullability::Nullable),
+    )
+}
+
 /// A 2D `Rect` (`geoarrow.box`) column over `(xmin, ymin, xmax, ymax)` boxes, stored as
 /// `Struct<xmin, ymin, xmax, ymax>`.
 pub(crate) fn rect_column(boxes: Vec<(f64, f64, f64, f64)>) -> VortexResult<ArrayRef> {

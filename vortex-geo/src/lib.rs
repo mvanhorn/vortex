@@ -26,6 +26,7 @@ use crate::scalar_fn::distance::GeoDistance;
 use crate::scalar_fn::intersects::GeoIntersects;
 
 pub mod aggregate_fn;
+pub mod bounds;
 pub mod extension;
 pub mod prune;
 pub mod scalar_fn;
