@@ -6,13 +6,13 @@
 //!
 //! [`Binary`]: super::Binary
 
-use super::decimal_add_sub_result_dtype;
-
 mod decimal;
 mod primitive;
 #[cfg(test)]
 mod tests;
 
+use decimal::result_decimal_dtype;
+pub(crate) use decimal::result_decimal_dtype as numeric_op_result_decimal_dtype;
 pub(crate) use primitive::PrimitiveOperand;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
@@ -57,7 +57,7 @@ pub(crate) fn execute_numeric(
             DType::Primitive(..) => lhs.dtype().with_nullability(nullability),
             DType::Decimal(decimal_dtype, _) => {
                 debug_assert!(matches!(op, NumericOperator::Add | NumericOperator::Sub));
-                DType::Decimal(decimal_add_sub_result_dtype(*decimal_dtype), nullability)
+                DType::Decimal(result_decimal_dtype(*decimal_dtype, op)?, nullability)
             }
             dtype => vortex_bail!("numeric operator is not supported for dtype {}", dtype),
         };

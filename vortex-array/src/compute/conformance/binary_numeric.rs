@@ -49,7 +49,7 @@ use crate::scalar::DecimalValue;
 use crate::scalar::NumericOperator;
 use crate::scalar::PrimitiveScalar;
 use crate::scalar::Scalar;
-use crate::scalar_fn::fns::binary::decimal_add_sub_result_dtype;
+use crate::scalar_fn::fns::binary::numeric_op_result_decimal_dtype;
 
 fn to_vec_of_scalar(array: &ArrayRef, ctx: &mut ExecutionCtx) -> Vec<Scalar> {
     // Not fast, but obviously correct
@@ -300,13 +300,14 @@ fn test_decimal_binary_numeric_with_scalar(
     let original_values = to_vec_of_scalar(&canonicalized_array, ctx);
 
     let scalar = Scalar::decimal(value, decimal_dtype, array.dtype().nullability());
-    let result_decimal_dtype = decimal_add_sub_result_dtype(decimal_dtype);
-    let result_dtype = DType::Decimal(result_decimal_dtype, array.dtype().nullability());
 
     // Decimal Mul/Div are not yet implemented.
     let operators = vec![NumericOperator::Add, NumericOperator::Sub];
 
     for operator in operators {
+        let result_decimal_dtype = numeric_op_result_decimal_dtype(decimal_dtype, operator)
+            .vortex_expect("decimal Add/Sub must have a result dtype");
+        let result_dtype = DType::Decimal(result_decimal_dtype, array.dtype().nullability());
         let rhs_const = ConstantArray::new(scalar.clone(), array.len()).into_array();
 
         for lhs_is_array in [true, false] {

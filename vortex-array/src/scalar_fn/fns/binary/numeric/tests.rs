@@ -5,8 +5,9 @@ use rstest::rstest;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 
-use super::decimal_add_sub_result_dtype;
+use super::result_decimal_dtype;
 use crate::ArrayRef;
+use crate::Columnar;
 use crate::IntoArray;
 use crate::RecursiveCanonical;
 use crate::VortexSessionExecute;
@@ -23,6 +24,7 @@ use crate::dtype::NativeDecimalType;
 use crate::dtype::Nullability;
 use crate::dtype::i256;
 use crate::scalar::DecimalValue;
+use crate::scalar::NumericOperator;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::validity::Validity;
@@ -246,59 +248,65 @@ fn decimal_constant(value: impl Into<DecimalValue>, dtype: DecimalDType, len: us
 }
 
 #[rstest]
-#[case::add(Operator::Add, [150i64, 225], [1050i64, 1225])]
-#[case::sub(Operator::Sub, [150i64, 225], [750i64, 775])]
+#[case::add(NumericOperator::Add, [150i64, 225], [1050i64, 1225])]
+#[case::sub(NumericOperator::Sub, [150i64, 225], [750i64, 775])]
 fn test_decimal_array_array(
-    #[case] op: Operator,
+    #[case] op: NumericOperator,
     #[case] rhs: [i64; 2],
     #[case] expected: [i64; 2],
-) {
+) -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
-    let result_dtype = decimal_add_sub_result_dtype(dtype);
+    let result_dtype = result_decimal_dtype(dtype, op)?;
     let lhs = DecimalArray::from_iter::<i64, _>([900, 1000], dtype).into_array();
     let rhs = DecimalArray::from_iter::<i64, _>(rhs, dtype).into_array();
 
-    let result = decimal_binary(lhs, rhs, op).unwrap();
+    let result = decimal_binary(lhs, rhs, op.into())?;
     assert_arrays_eq!(
         result,
         DecimalArray::from_iter::<i64, _>(expected, result_dtype),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
-fn test_decimal_mixed_storage_widths() {
+fn test_decimal_mixed_storage_widths() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let lhs = DecimalArray::from_iter::<i32, _>([100, 250], dtype).into_array();
     let rhs = DecimalArray::from_iter::<i128, _>([200, 250], dtype).into_array();
 
-    let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
+    let result = decimal_binary(lhs, rhs, Operator::Add)?;
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([300, 500], decimal_add_sub_result_dtype(dtype)),
+        DecimalArray::from_iter::<i64, _>(
+            [300, 500],
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
+        ),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
-fn test_decimal_nullable_lanes() {
+fn test_decimal_nullable_lanes() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let lhs =
         DecimalArray::from_option_iter::<i64, _>([Some(100), None, Some(300)], dtype).into_array();
     let rhs = DecimalArray::from_iter::<i64, _>([50, 50, 50], dtype).into_array();
 
-    let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
+    let result = decimal_binary(lhs, rhs, Operator::Add)?;
     assert_arrays_eq!(
         result,
         DecimalArray::from_option_iter::<i64, _>(
             [Some(150), None, Some(350)],
-            decimal_add_sub_result_dtype(dtype),
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
         ),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
@@ -369,7 +377,7 @@ fn test_decimal_result_uses_widened_logical_storage_width(
     #[case] values: DecimalArray,
     #[case] expected_type: DecimalType,
 ) -> VortexResult<()> {
-    let expected_dtype = decimal_add_sub_result_dtype(values.decimal_dtype());
+    let expected_dtype = result_decimal_dtype(values.decimal_dtype(), NumericOperator::Add)?;
     let result = decimal_binary(
         values.clone().into_array(),
         values.into_array(),
@@ -428,22 +436,26 @@ fn test_decimal_empty_constants_do_not_evaluate() -> VortexResult<()> {
 }
 
 #[test]
-fn test_decimal_constant_lhs_non_commutative() {
+fn test_decimal_constant_lhs_non_commutative() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let lhs = decimal_constant(1000i64, dtype, 2);
     let rhs = DecimalArray::from_iter::<i64, _>([250, 400], dtype).into_array();
 
-    let result = decimal_binary(lhs, rhs, Operator::Sub).unwrap();
+    let result = decimal_binary(lhs, rhs, Operator::Sub)?;
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([750, 600], decimal_add_sub_result_dtype(dtype),),
+        DecimalArray::from_iter::<i64, _>(
+            [750, 600],
+            result_decimal_dtype(dtype, NumericOperator::Sub)?,
+        ),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
-fn test_decimal_nullable_constant_preserves_nullable_output() {
+fn test_decimal_nullable_constant_preserves_nullable_output() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let values = DecimalArray::from_iter::<i64, _>([100, 200], dtype).into_array();
@@ -453,19 +465,22 @@ fn test_decimal_nullable_constant_preserves_nullable_output() {
     )
     .into_array();
 
-    let result = decimal_binary(values, constant, Operator::Add).unwrap();
+    let result = decimal_binary(values, constant, Operator::Add)?;
     assert_arrays_eq!(
         result,
         DecimalArray::from_option_iter::<i64, _>(
             [Some(150), Some(250)],
-            decimal_add_sub_result_dtype(dtype),
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
         ),
         &mut ctx
     );
+    Ok(())
 }
 
-#[test]
-fn test_decimal_null_constant_yields_all_null() {
+#[rstest]
+#[case::null_lhs(true)]
+#[case::null_rhs(false)]
+fn test_decimal_null_constant_yields_all_null(#[case] null_lhs: bool) -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let values = DecimalArray::from_iter::<i64, _>([100, 200], dtype).into_array();
@@ -474,62 +489,80 @@ fn test_decimal_null_constant_yields_all_null() {
         2,
     )
     .into_array();
+    let (lhs, rhs) = if null_lhs {
+        (null_constant, values)
+    } else {
+        (values, null_constant)
+    };
 
-    let result = decimal_binary(values, null_constant, Operator::Add).unwrap();
+    let result = lhs
+        .binary(rhs, Operator::Add)?
+        .execute::<Columnar>(&mut ctx)?;
+    assert!(matches!(&result, Columnar::Constant(_)));
     assert_arrays_eq!(
-        result,
-        DecimalArray::from_option_iter::<i64, _>([None, None], decimal_add_sub_result_dtype(dtype),),
+        result.into_array(),
+        DecimalArray::from_option_iter::<i64, _>(
+            [None, None],
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
+        ),
         &mut ctx
     );
+    Ok(())
 }
 
 /// A constant stored in a wider variant than the array storage participates through the widened
 /// working type.
 #[test]
-fn test_decimal_constant_wider_than_array_storage() {
+fn test_decimal_constant_wider_than_array_storage() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(20, 0);
     let values = DecimalArray::from_iter::<i8, _>([1, 2], dtype).into_array();
     let constant = decimal_constant(10_000_000_000i64, dtype, 2);
 
-    let result = decimal_binary(values, constant, Operator::Add).unwrap();
+    let result = decimal_binary(values, constant, Operator::Add)?;
     assert_arrays_eq!(
         result,
         DecimalArray::from_iter::<i64, _>(
             [10_000_000_001, 10_000_000_002],
-            decimal_add_sub_result_dtype(dtype),
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
         ),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
-fn test_decimal_empty() {
+fn test_decimal_empty() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let empty = DecimalArray::from_iter::<i64, _>([], dtype).into_array();
 
-    let result = decimal_binary(empty.clone(), empty, Operator::Add).unwrap();
+    let result = decimal_binary(empty.clone(), empty, Operator::Add)?;
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([], decimal_add_sub_result_dtype(dtype)),
+        DecimalArray::from_iter::<i64, _>([], result_decimal_dtype(dtype, NumericOperator::Add)?,),
         &mut ctx
     );
+    Ok(())
 }
 
 #[test]
-fn test_decimal_constant_constant_folds() {
+fn test_decimal_constant_constant_folds() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(10, 2);
     let lhs = decimal_constant(150i64, dtype, 3);
     let rhs = decimal_constant(50i64, dtype, 3);
 
-    let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
+    let result = decimal_binary(lhs, rhs, Operator::Add)?;
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i64, _>([200, 200, 200], decimal_add_sub_result_dtype(dtype),),
+        DecimalArray::from_iter::<i64, _>(
+            [200, 200, 200],
+            result_decimal_dtype(dtype, NumericOperator::Add)?,
+        ),
         &mut ctx
     );
+    Ok(())
 }
 
 #[rstest]
