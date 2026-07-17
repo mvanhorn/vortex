@@ -89,6 +89,10 @@ pub(crate) fn validate_geometry_operands(dtypes: &[DType]) -> VortexResult<()> {
 
 /// Flatten a native geometry column into a single coordinate `Struct<x, y, ...>` containing
 /// every vertex of every geometry.
+///
+/// Reads the coordinate buffers directly and ignores row validity, so a null row's placeholder
+/// coordinates are included. Callers that must exclude nulls (e.g. the AABB stat) filter the
+/// column first.
 pub(crate) fn flatten_coordinates(
     array: &ArrayRef,
     ctx: &mut ExecutionCtx,
@@ -115,6 +119,9 @@ pub(crate) fn flatten_coordinates(
 }
 
 /// Decode a native geometry column to `geo_types`. A non-geometry operand is an error.
+///
+/// Every row must be present: a null row has no decodable geometry (the per-type decoders reject
+/// it), so callers filter out null rows first.
 pub(crate) fn geometries(
     array: &ArrayRef,
     ctx: &mut ExecutionCtx,
