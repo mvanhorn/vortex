@@ -342,13 +342,13 @@ fn test_decimal_overflow_on_null_lane_ignored() {
 fn test_decimal_add_reserves_carry_digit() {
     let mut ctx = array_session().create_execution_ctx();
     let dtype = DecimalDType::new(2, 0);
-    let lhs = DecimalArray::from_iter::<i8, _>([60], dtype).into_array();
-    let rhs = DecimalArray::from_iter::<i8, _>([60], dtype).into_array();
+    let lhs = DecimalArray::from_iter::<i8, _>([99], dtype).into_array();
+    let rhs = DecimalArray::from_iter::<i8, _>([99], dtype).into_array();
 
     let result = decimal_binary(lhs, rhs, Operator::Add).unwrap();
     assert_arrays_eq!(
         result,
-        DecimalArray::from_iter::<i16, _>([120], DecimalDType::new(3, 0)),
+        DecimalArray::from_iter::<i16, _>([198], DecimalDType::new(3, 0)),
         &mut ctx
     );
 }

@@ -20,6 +20,7 @@ mod tests {
     use crate::compute::conformance::binary_numeric::test_binary_numeric_array;
     use crate::compute::conformance::consistency::test_array_consistency;
     use crate::dtype::DecimalDType;
+    use crate::dtype::NativeDecimalType;
     use crate::validity::Validity;
 
     #[rstest]
@@ -81,6 +82,14 @@ mod tests {
     #[case::decimal_narrow_storage(DecimalArray::new(
         buffer![10i8, 20i8, 30i8],
         DecimalDType::new(5, 1),
+        Validity::NonNullable,
+    ))]
+    #[case::decimal_widened_carry(DecimalArray::new(
+        buffer![
+            <i128 as NativeDecimalType>::MAX_BY_PRECISION[38],
+            <i128 as NativeDecimalType>::MIN_BY_PRECISION[38],
+        ],
+        DecimalDType::new(38, 0),
         Validity::NonNullable,
     ))]
     #[case::decimal_single(DecimalArray::new(

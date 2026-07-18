@@ -25,6 +25,8 @@ use std::fmt::Debug;
 
 use itertools::Itertools;
 use num_traits::Bounded;
+use num_traits::CheckedAdd;
+use num_traits::CheckedSub;
 use num_traits::Float;
 use num_traits::Num;
 use num_traits::Signed;
@@ -328,14 +330,19 @@ fn test_decimal_binary_numeric_with_scalar(
                     let (Some(lhs), Some(rhs)) = (lhs.decimal_value(), rhs.decimal_value()) else {
                         return Some(Scalar::null(result_dtype.clone()));
                     };
+                    let lhs = lhs.as_i256();
+                    let rhs = rhs.as_i256();
                     let value = match operator {
                         NumericOperator::Add => lhs.checked_add(&rhs),
                         NumericOperator::Sub => lhs.checked_sub(&rhs),
                         NumericOperator::Mul | NumericOperator::Div => unreachable!(),
                     }?;
-                    value.fits_in_precision(result_decimal_dtype).then(|| {
-                        Scalar::decimal(value, result_decimal_dtype, result_dtype.nullability())
-                    })
+                    let value = DecimalValue::try_from_i256(value, result_decimal_dtype).ok()?;
+                    Some(Scalar::decimal(
+                        value,
+                        result_decimal_dtype,
+                        result_dtype.nullability(),
+                    ))
                 })
                 .collect();
 
